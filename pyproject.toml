@@ -52,3 +52,6 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 include = ["instrData*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.so", "*.pyd", "*.dylib"]

@@ -97,10 +97,19 @@ def build_xed():
     # Copy to project root
     xed_modules = list(xed_dir.glob("xed*.so")) + list(xed_dir.glob("xed*.pyd"))
     if xed_modules:
-        dest = Path(".") / xed_modules[0].name
-        shutil.copy2(xed_modules[0], dest)
-        print(f"\n✓ XED module built successfully: {dest.name}")
-        print(f"  Size: {dest.stat().st_size / 1024 / 1024:.1f} MB")
+        dest_root = Path(".") / xed_modules[0].name
+        shutil.copy2(xed_modules[0], dest_root)
+        print(f"\n✓ XED module built successfully: {dest_root.name}")
+        print(f"  Size: {dest_root.stat().st_size / 1024 / 1024:.1f} MB")
+
+        # Also copy to site-packages for console scripts (if .venv exists)
+        venv_path = Path(".venv")
+        if venv_path.exists():
+            site_packages = list(venv_path.glob("lib/python*/site-packages"))
+            if site_packages:
+                dest_site = site_packages[0] / xed_modules[0].name
+                shutil.copy2(xed_modules[0], dest_site)
+                print(f"  Copied to site-packages: {dest_site}")
     else:
         print("\nError: XED build completed but no module found")
         sys.exit(1)
@@ -111,9 +120,15 @@ def main():
     generate_instruction_data()
     print()  # Blank line between steps
     build_xed()
+
+    # Touch pyproject.toml to invalidate uv's cache
+    # This makes uv reinstall the package on next use
+    pyproject = Path("pyproject.toml")
+    pyproject.touch()
+
     print("\n" + "=" * 60)
     print("✓ Build complete!")
-    print("Run: uv run ./uiCA.py --help")
+    print("Run: uv run uica --help")
     print("=" * 60)
 
 

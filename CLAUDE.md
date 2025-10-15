@@ -10,32 +10,36 @@ uiCA (uops.info Code Analyzer) is a CPU pipeline simulator that predicts through
 
 ## Setup (First Time)
 
-From a fresh clone, run these 3 commands:
+From a fresh clone, run these 2 commands:
 
 ```bash
 # 1. Initialize submodules (gets XED disassembler source)
 git submodule update --init --recursive
 
-# 2. Build XED Python module (one-time, takes ~2 minutes)
+# 2. Build XED and download instruction data (~2-3 minutes)
 uv run --with setuptools python build.py
-
-# 3. Run uiCA
-uv run ./uiCA.py --help
 ```
 
-That's it! The `instrData/` directory with instruction performance data is already committed to the repo.
+The `build.py` script:
+- Downloads instructions.xml (~110MB) from uops.info
+- Converts it to Python data files in `instrData/` (~12MB)
+- Builds XED disassembler from submodule → `xed*.so` (~7MB)
+- Copies xed.so to virtualenv's site-packages
+- Touches pyproject.toml to trigger package mapping update
+
+**Note**: The first `uv run uica` command will automatically rebuild the package mapping (takes <1 second). This is normal.
 
 ## Dependencies
 
-- XED disassembler (built from XED-to-XML submodule → xed*.so)
-- Instruction data in instrData/ (pre-generated, committed to repo)
+- XED disassembler (built from XED-to-XML submodule → platform-specific xed*.so)
+- Instruction data (downloaded from uops.info, converted to instrData/)
 - Python packages (auto-installed by uv): plotly
 
 ## Usage
 
 Basic usage:
 ```bash
-./uiCA.py <binary_file> -arch <ARCH>
+uv run uica <binary_file> -arch <ARCH>
 ```
 
 Common architectures: SKL (Skylake), SKX (Skylake-X), ICL (Ice Lake), TGL (Tiger Lake)
