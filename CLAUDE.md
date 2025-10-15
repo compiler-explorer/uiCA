@@ -8,24 +8,28 @@ uiCA (uops.info Code Analyzer) is a CPU pipeline simulator that predicts through
 
 **This is Compiler Explorer's fork** (on the `ce` branch). The primary goal is to make uiCA runnable and installable with `uv` in a virtual environment, eliminating the need for setup.sh and manual submodule building.
 
-## Current State & Goals
+## Setup (First Time)
 
-**Current setup** (to be replaced):
-- `setup.sh` builds XED-to-XML submodule and downloads/converts instruction data
-- Requires manual git submodule management
-- Not pip/uv installable
+From a fresh clone, run these 3 commands:
 
-**Target setup** (using uv):
-- Package should be installable via `uv pip install` or `uv run`
-- Dependencies managed in pyproject.toml
-- XED library should be pre-built or fetched as a dependency
-- Instruction data (from uops.info) should be included or downloaded during install
+```bash
+# 1. Initialize submodules (gets XED disassembler source)
+git submodule update --init --recursive
+
+# 2. Build XED Python module (one-time, takes ~2 minutes)
+uv run --with setuptools python build.py
+
+# 3. Run uiCA
+uv run ./uiCA.py --help
+```
+
+That's it! The `instrData/` directory with instruction performance data is already committed to the repo.
 
 ## Dependencies
 
-- XED disassembler (currently built from XED-to-XML submodule)
-- instructions.xml from uops.info (converted to Python data in instrData/)
-- Python packages: plotly, pydot (Windows), graphviz (optional for dependency graphs)
+- XED disassembler (built from XED-to-XML submodule → xed*.so)
+- Instruction data in instrData/ (pre-generated, committed to repo)
+- Python packages (auto-installed by uv): plotly
 
 ## Usage
 
