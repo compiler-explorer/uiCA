@@ -8,7 +8,7 @@ from collections import Counter, deque, namedtuple, OrderedDict
 from concurrent import futures
 from heapq import heappop, heappush
 from itertools import count, repeat
-from typing import List, Dict, NamedTuple, Optional
+from typing import List, Dict, NamedTuple, Optional, Tuple, Any
 
 import random
 random.seed(0)
@@ -832,6 +832,7 @@ class Scheduler:
       self.blockedResources = dict() # for how many remaining cycle a resource will be blocked
       self.blockedResources['div'] = 0
       self.dependentUops = dict() # uops that have an operand that is written by a non-executed uop
+      self.blockingInfo: List[BlockingEvent] = [] # tracks why ready uops don't dispatch each cycle
 
    def isFull(self):
       return len(self.uops) + self.uArchConfig.issueWidth > self.uArchConfig.RSWidth
@@ -880,6 +881,9 @@ class Scheduler:
                and ((not self.readyQueue['0']) or self.readyDivUops[0][0] < self.readyQueue['0'][0][0])):
             queue = self.readyDivUops
          if self.blockedResources.get('port' + port):
+            # Record all uops in this port's queue as blocked by resource
+            for _, uop in queue:
+               self.blockingInfo.append(BlockingEvent(clock, uop, 'port_blocked_resource', {'port': port}))
             continue
          if not queue:
             continue
@@ -891,9 +895,23 @@ class Scheduler:
          uopsDispatched.append(uop)
          self.pendingUops.add(uop)
 
+         # Record that remaining uops in queue were passed over by an older uop
+         for _, remaining_uop in queue:
+            self.blockingInfo.append(BlockingEvent(clock, remaining_uop, 'port_busy_older_uop', {
+               'port': port,
+               'dispatchedInstead': uop
+            }))
+
          self.blockedResources['div'] += uop.prop.divCycles
          if self.uArchConfig.slow256BitMemAcc and (port == '4') and ('M256' in uop.instrI.instr.instrStr):
             self.blockedResources['port' + port] = 2
+
+      # Check for uops on ports that were removed from applicablePorts
+      allPortsList = list(allPorts[self.uArchConfig.name])
+      for port in allPortsList:
+         if port not in applicablePorts:
+            for _, uop in self.readyQueue[port]:
+               self.blockingInfo.append(BlockingEvent(clock, uop, 'port_removed_by_constraint', {'port': port}))
 
       for uop in self.uopsDispatchedInPrevCycle:
          self.portUsage[uop.actualPort] -= 1
@@ -1441,6 +1459,7 @@ def canBeInDSB(block, DSBBlockSize):
    return True
 
 
+BlockingEvent = NamedTuple('BlockingEvent', [('clock', int), ('uop', 'Uop'), ('reason', str), ('details', Dict[str, Any])])
 TableLineData = NamedTuple('TableLineData', [('string', str), ('instr', Optional[Instr]), ('url', Optional[str]), ('uopsForRnd', List[List[LaminatedUop]])])
 
 def getUopsTableColumns(tableLineData: List[TableLineData], uArchConfig: MicroArchConfig):
@@ -1795,7 +1814,7 @@ def generateHTMLGraph(filename, instructions, instrInstances: List[InstrInstance
    writeHtmlFile(filename, 'Graph', head, body, includeDOCTYPE=False) # if DOCTYPE is included, scaling doesn't work properly
 
 
-def generateJSONOutput(filename, instructions: List[Instr], frontEnd: FrontEnd, uArchConfig: MicroArchConfig, maxCycle):
+def generateJSONOutput(filename: str, instructions: List[Instr], frontEnd: FrontEnd, uArchConfig: MicroArchConfig, maxCycle: int, scheduler: 'Scheduler'):
    parameters = {
       'uArchName': uArchConfig.name,
       'IQWidth': uArchConfig.IQWidth,
@@ -1885,6 +1904,40 @@ def generateJSONOutput(filename, instructions: List[Instr], frontEnd: FrontEnd, 
                   cycles[uop.dispatched].setdefault('dispatched', {})['Port' + uop.actualPort] = unfusedUopDict
                if (uop.executed is not None) and (uop.executed <= maxCycle):
                   cycles[uop.executed].setdefault('executed', []).append(unfusedUopDict)
+
+   # Process blocking information from scheduler
+   # Group by uop, then deduplicate consecutive same-reason events
+   uopBlockingEvents: Dict[Uop, List[Tuple[int, str, Dict[str, Any]]]] = {}
+   for event in scheduler.blockingInfo:
+      if event.clock > maxCycle:
+         continue
+      if event.uop not in uopBlockingEvents:
+         uopBlockingEvents[event.uop] = []
+      uopBlockingEvents[event.uop].append((event.clock, event.reason, event.details))
+
+   # Add to cycles, but only when reason changes from previous cycle
+   for uop, events in uopBlockingEvents.items():
+      if uop not in unfusedUopToDict:
+         continue  # Uop might not be in the tracked range
+
+      lastReason = None
+      for clock, reason, details in events:
+         if reason != lastReason:
+            # Create blocking event dict based on uop's identity
+            blockingDict = unfusedUopToDict[uop].copy()
+            blockingDict['reason'] = reason
+
+            # Add details (port, etc.)
+            for key, value in details.items():
+               if key == 'dispatchedInstead':
+                  # Convert uop reference to dict
+                  if value in unfusedUopToDict:
+                     blockingDict['dispatchedInstead'] = unfusedUopToDict[value]
+               else:
+                  blockingDict[key] = value
+
+            cycles[clock].setdefault('blockedFromDispatch', []).append(blockingDict)
+            lastReason = reason
 
    import json
    jsonStr = json.dumps({'parameters': parameters, 'instructions': instrList, 'cycles': cycles}, sort_keys=True)
@@ -2003,7 +2056,7 @@ def runSimulation(disas, uArchConfig: MicroArchConfig, alignmentOffset, initPoli
       generateGraphvizOutputForLatencyGraph(instructions, nodesForInstr, edgesForNode, edgesOnMaxCycle, comp, depGraphFile)
 
    if jsonFile is not None:
-      generateJSONOutput(jsonFile, instructions, frontEnd, uArchConfig, clock-1)
+      generateJSONOutput(jsonFile, instructions, frontEnd, uArchConfig, clock-1, scheduler)
 
    return TP
 
