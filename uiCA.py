@@ -168,6 +168,7 @@ class Renamer:
       self.storeBufferEntryDict = {}
 
       self.lastRegMergeIssued = None # last uop for which register merge uops were issued
+      self.blockingInfo: List[BlockingEvent] = [] # tracks why uops in IDQ don't issue each cycle
 
    def cycle(self):
       self.renamerActiveCycle += 1
@@ -187,12 +188,27 @@ class Renamer:
                   renamerUops.append(mergeUop)
                   firstUnfusedUop.instrI.regMergeUops.append(LaminatedUop([mergeUop]))
                self.lastRegMergeIssued = firstUnfusedUop
+               # Record that remaining IDQ uops blocked by register merge requirement
+               for lamUop in self.IDQ:
+                  for fUop in lamUop.getFusedUops():
+                     for uop in fUop.getUnfusedUops():
+                        self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'register_merge_required', {}))
                break
 
          if firstUnfusedUop.prop.isFirstUopOfInstr and firstUnfusedUop.prop.instr.isSerializingInstr and not self.reorderBuffer.isEmpty():
+            # Record that this serializing instruction is blocked
+            for uop in lamUop.getUnfusedUops():
+               self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'serializing_instruction_waiting', {}))
             break
          fusedUops = lamUop.getFusedUops()
          if len(renamerUops) + len(fusedUops) > self.uArchConfig.issueWidth:
+            # Record that this lamUop and all remaining IDQ uops blocked by issue width
+            for uop in lamUop.getUnfusedUops():
+               self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded', {}))
+            for remainingLamUop in list(self.IDQ)[1:]:  # Skip first (already handled)
+               for fUop in remainingLamUop.getFusedUops():
+                  for uop in fUop.getUnfusedUops():
+                     self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded', {}))
             break
          renamerUops.extend(fusedUops)
          self.IDQ.popleft()
@@ -408,6 +424,13 @@ class FrontEnd:
       issueUops = []
       if not self.reorderBuffer.isFull() and not self.scheduler.isFull(): # len(self.IDQ) >= uArchConfig.issueWidth and the first check seems to be wrong, but leads to better results
          issueUops = self.renamer.cycle()
+      else:
+         # Record all uops in IDQ as blocked by RB or RS full
+         reason = 'reorder_buffer_full' if self.reorderBuffer.isFull() else 'reservation_station_full'
+         for lamUop in self.IDQ:
+            for fUop in lamUop.getFusedUops():
+               for uop in fUop.getUnfusedUops():
+                  self.renamer.blockingInfo.append(BlockingEvent(clock, uop, reason, {}))
 
       for fusedUop in issueUops:
          fusedUop.issued = clock
@@ -1814,7 +1837,7 @@ def generateHTMLGraph(filename, instructions, instrInstances: List[InstrInstance
    writeHtmlFile(filename, 'Graph', head, body, includeDOCTYPE=False) # if DOCTYPE is included, scaling doesn't work properly
 
 
-def generateJSONOutput(filename: str, instructions: List[Instr], frontEnd: FrontEnd, uArchConfig: MicroArchConfig, maxCycle: int, scheduler: 'Scheduler'):
+def generateJSONOutput(filename: str, instructions: List[Instr], frontEnd: FrontEnd, uArchConfig: MicroArchConfig, maxCycle: int, scheduler: 'Scheduler', renamer: 'Renamer'):
    parameters = {
       'uArchName': uArchConfig.name,
       'IQWidth': uArchConfig.IQWidth,
@@ -1939,6 +1962,34 @@ def generateJSONOutput(filename: str, instructions: List[Instr], frontEnd: Front
             cycles[clock].setdefault('blockedFromDispatch', []).append(blockingDict)
             lastReason = reason
 
+   # Process issue blocking information from renamer
+   uopIssueBlockingEvents: Dict[Uop, List[Tuple[int, str, Dict[str, Any]]]] = {}
+   for event in renamer.blockingInfo:
+      if event.clock > maxCycle:
+         continue
+      if event.uop not in uopIssueBlockingEvents:
+         uopIssueBlockingEvents[event.uop] = []
+      uopIssueBlockingEvents[event.uop].append((event.clock, event.reason, event.details))
+
+   # Add to cycles, but only when reason changes from previous cycle
+   for uop, events in uopIssueBlockingEvents.items():
+      if uop not in unfusedUopToDict:
+         continue  # Uop might not be in the tracked range
+
+      lastReason = None
+      for clock, reason, details in events:
+         if reason != lastReason:
+            # Create blocking event dict based on uop's identity
+            blockingDict = unfusedUopToDict[uop].copy()
+            blockingDict['reason'] = reason
+
+            # Add details if any
+            for key, value in details.items():
+               blockingDict[key] = value
+
+            cycles[clock].setdefault('blockedFromIssue', []).append(blockingDict)
+            lastReason = reason
+
    import json
    jsonStr = json.dumps({'parameters': parameters, 'instructions': instrList, 'cycles': cycles}, sort_keys=True)
 
@@ -2056,7 +2107,7 @@ def runSimulation(disas, uArchConfig: MicroArchConfig, alignmentOffset, initPoli
       generateGraphvizOutputForLatencyGraph(instructions, nodesForInstr, edgesForNode, edgesOnMaxCycle, comp, depGraphFile)
 
    if jsonFile is not None:
-      generateJSONOutput(jsonFile, instructions, frontEnd, uArchConfig, clock-1, scheduler)
+      generateJSONOutput(jsonFile, instructions, frontEnd, uArchConfig, clock-1, scheduler, frontEnd.renamer)
 
    return TP
 
