@@ -1854,10 +1854,12 @@ def _groupAndDeduplicateBlockingEvents(events, maxCycle, getKey):
    for key, eventList in grouped.items():
       deduplicated[key] = []
       lastReason = None
+      lastDetails = None
       for clock, reason, details in eventList:
-         if reason != lastReason:
+         if reason != lastReason or details != lastDetails:
             deduplicated[key].append((clock, reason, details))
             lastReason = reason
+            lastDetails = details
 
    return deduplicated
 
