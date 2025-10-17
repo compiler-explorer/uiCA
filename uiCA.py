@@ -2,14 +2,13 @@
 
 import argparse
 import importlib
-import json
 import os
 import re
 from collections import Counter, deque, namedtuple, OrderedDict
 from concurrent import futures
 from heapq import heappop, heappush
 from itertools import count, repeat
-from typing import List, Dict, NamedTuple, Optional, Tuple, Any
+from typing import List, Dict, NamedTuple, Optional
 
 import random
 random.seed(0)
@@ -192,22 +191,22 @@ class Renamer:
                # Record that remaining IDQ uops blocked by register merge requirement
                for lamUop in self.IDQ:
                   for uop in lamUop.getUnfusedUops():
-                     self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'register_merge_required'))
+                     self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'register_merge_required', {}))
                break
 
          if firstUnfusedUop.prop.isFirstUopOfInstr and firstUnfusedUop.prop.instr.isSerializingInstr and not self.reorderBuffer.isEmpty():
             # Record that this serializing instruction is blocked
             for uop in lamUop.getUnfusedUops():
-               self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'serializing_instruction_waiting'))
+               self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'serializing_instruction_waiting', {}))
             break
          fusedUops = lamUop.getFusedUops()
          if len(renamerUops) + len(fusedUops) > self.uArchConfig.issueWidth:
             # Record that this lamUop and all remaining IDQ uops blocked by issue width
             for uop in lamUop.getUnfusedUops():
-               self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded'))
+               self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded', {}))
             for remainingLamUop in list(self.IDQ)[1:]:  # Skip first (already handled)
                for uop in remainingLamUop.getUnfusedUops():
-                  self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded'))
+                  self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded', {}))
             break
          renamerUops.extend(fusedUops)
          self.IDQ.popleft()
@@ -429,7 +428,7 @@ class FrontEnd:
          reason = 'reorder_buffer_full' if self.reorderBuffer.isFull() else 'reservation_station_full'
          for lamUop in self.IDQ:
             for uop in lamUop.getUnfusedUops():
-               self.renamer.blockingInfo.append(BlockingEvent(clock, uop, reason))
+               self.renamer.blockingInfo.append(BlockingEvent(clock, uop, reason, {}))
 
       for fusedUop in issueUops:
          fusedUop.issued = clock
@@ -1368,8 +1367,8 @@ class InstrInstance:
       return laminatedDomainUops
 
 
-BlockingEvent = namedtuple('BlockingEvent', ['clock', 'uop', 'reason', 'details'], defaults=[{}])
-InstructionBlockingEvent = namedtuple('InstructionBlockingEvent', ['clock', 'instrInstance', 'reason', 'details'], defaults=[{}])
+BlockingEvent = namedtuple('BlockingEvent', ['clock', 'uop', 'reason', 'details'])
+InstructionBlockingEvent = namedtuple('InstructionBlockingEvent', ['clock', 'instrInstance', 'reason', 'details'])
 
 def split64ByteBlockTo16ByteBlocks(cacheBlock):
    return [[ii for ii in cacheBlock if b*16 <= ii.address % 64 < (b+1)*16 ] for b in range(0,4)]
@@ -1863,6 +1862,7 @@ def _groupAndDeduplicateBlockingEvents(events, maxCycle, getKey):
    return deduplicated
 
 def generateJSONOutput(filename, instructions, frontEnd, uArchConfig, maxCycle, scheduler, renamer):
+   import json
    parameters = {
       'uArchName': uArchConfig.name,
       'IQWidth': uArchConfig.IQWidth,
