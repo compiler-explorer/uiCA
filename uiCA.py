@@ -373,6 +373,7 @@ class FrontEnd:
       self.unroll = unroll
       self.alignmentOffset = alignmentOffset
       self.perfEvents = perfEvents
+      self.blockingInfo: List[InstructionBlockingEvent] = [] # tracks why instructions can't be decoded each cycle
 
       self.MS = MicrocodeSequencer(self.uArchConfig)
 
@@ -447,6 +448,9 @@ class FrontEnd:
 
       if len(self.IDQ) + self.uArchConfig.DSBWidth > self.uArchConfig.IDQWidth:
          self.perfEvents.setdefault(clock, {})['IDQFull'] = 1
+         # Record all instructions in instruction queue as blocked from decode
+         for instrI in self.instructionQueue:
+            self.blockingInfo.append(InstructionBlockingEvent(clock, instrI, 'idq_full', {'idqSize': len(self.IDQ)}))
          return
 
       if self.uopSource is None:
@@ -1483,6 +1487,7 @@ def canBeInDSB(block, DSBBlockSize):
 
 
 BlockingEvent = NamedTuple('BlockingEvent', [('clock', int), ('uop', 'Uop'), ('reason', str), ('details', Dict[str, Any])])
+InstructionBlockingEvent = NamedTuple('InstructionBlockingEvent', [('clock', int), ('instrInstance', 'InstrInstance'), ('reason', str), ('details', Dict[str, Any])])
 TableLineData = NamedTuple('TableLineData', [('string', str), ('instr', Optional[Instr]), ('url', Optional[str]), ('uopsForRnd', List[List[LaminatedUop]])])
 
 def getUopsTableColumns(tableLineData: List[TableLineData], uArchConfig: MicroArchConfig):
@@ -1988,6 +1993,30 @@ def generateJSONOutput(filename: str, instructions: List[Instr], frontEnd: Front
                blockingDict[key] = value
 
             cycles[clock].setdefault('blockedFromIssue', []).append(blockingDict)
+            lastReason = reason
+
+   # Process front-end blocking information
+   # Group by instruction instance, then deduplicate consecutive same-reason events
+   instrBlockingEvents: Dict['InstrInstance', List[Tuple[int, str, Dict[str, Any]]]] = {}
+   for event in frontEnd.blockingInfo:
+      if event.clock > maxCycle:
+         continue
+      if event.instrInstance not in instrBlockingEvents:
+         instrBlockingEvents[event.instrInstance] = []
+      instrBlockingEvents[event.instrInstance].append((event.clock, event.reason, event.details))
+
+   # Add to cycles, but only when reason changes from previous cycle
+   for instrI, events in instrBlockingEvents.items():
+      instrID = instrToID[instrI.instr]
+      rnd = instrI.rnd
+      lastReason = None
+      for clock, reason, details in events:
+         if reason != lastReason:
+            blockingDict = {'instrID': instrID, 'rnd': rnd}
+            blockingDict['reason'] = reason
+            for key, value in details.items():
+               blockingDict[key] = value
+            cycles[clock].setdefault('blockedFromDecode', []).append(blockingDict)
             lastReason = reason
 
    import json
