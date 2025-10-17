@@ -2,6 +2,7 @@
 
 import argparse
 import importlib
+import json
 import os
 import re
 from collections import Counter, deque, namedtuple, OrderedDict
@@ -168,7 +169,7 @@ class Renamer:
       self.storeBufferEntryDict = {}
 
       self.lastRegMergeIssued = None # last uop for which register merge uops were issued
-      self.blockingInfo: List[BlockingEvent] = [] # tracks why uops in IDQ don't issue each cycle
+      self.blockingInfo = [] # tracks why uops in IDQ don't issue each cycle
 
    def cycle(self):
       self.renamerActiveCycle += 1
@@ -190,25 +191,23 @@ class Renamer:
                self.lastRegMergeIssued = firstUnfusedUop
                # Record that remaining IDQ uops blocked by register merge requirement
                for lamUop in self.IDQ:
-                  for fUop in lamUop.getFusedUops():
-                     for uop in fUop.getUnfusedUops():
-                        self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'register_merge_required', {}))
+                  for uop in lamUop.getUnfusedUops():
+                     self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'register_merge_required'))
                break
 
          if firstUnfusedUop.prop.isFirstUopOfInstr and firstUnfusedUop.prop.instr.isSerializingInstr and not self.reorderBuffer.isEmpty():
             # Record that this serializing instruction is blocked
             for uop in lamUop.getUnfusedUops():
-               self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'serializing_instruction_waiting', {}))
+               self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'serializing_instruction_waiting'))
             break
          fusedUops = lamUop.getFusedUops()
          if len(renamerUops) + len(fusedUops) > self.uArchConfig.issueWidth:
             # Record that this lamUop and all remaining IDQ uops blocked by issue width
             for uop in lamUop.getUnfusedUops():
-               self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded', {}))
+               self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded'))
             for remainingLamUop in list(self.IDQ)[1:]:  # Skip first (already handled)
-               for fUop in remainingLamUop.getFusedUops():
-                  for uop in fUop.getUnfusedUops():
-                     self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded', {}))
+               for uop in remainingLamUop.getUnfusedUops():
+                  self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded'))
             break
          renamerUops.extend(fusedUops)
          self.IDQ.popleft()
@@ -373,7 +372,7 @@ class FrontEnd:
       self.unroll = unroll
       self.alignmentOffset = alignmentOffset
       self.perfEvents = perfEvents
-      self.blockingInfo: List[InstructionBlockingEvent] = [] # tracks why instructions can't be decoded each cycle
+      self.blockingInfo = [] # tracks why instructions can't be decoded each cycle
 
       self.MS = MicrocodeSequencer(self.uArchConfig)
 
@@ -429,9 +428,8 @@ class FrontEnd:
          # Record all uops in IDQ as blocked by RB or RS full
          reason = 'reorder_buffer_full' if self.reorderBuffer.isFull() else 'reservation_station_full'
          for lamUop in self.IDQ:
-            for fUop in lamUop.getFusedUops():
-               for uop in fUop.getUnfusedUops():
-                  self.renamer.blockingInfo.append(BlockingEvent(clock, uop, reason, {}))
+            for uop in lamUop.getUnfusedUops():
+               self.renamer.blockingInfo.append(BlockingEvent(clock, uop, reason))
 
       for fusedUop in issueUops:
          fusedUop.issued = clock
@@ -859,7 +857,7 @@ class Scheduler:
       self.blockedResources = dict() # for how many remaining cycle a resource will be blocked
       self.blockedResources['div'] = 0
       self.dependentUops = dict() # uops that have an operand that is written by a non-executed uop
-      self.blockingInfo: List[BlockingEvent] = [] # tracks why ready uops don't dispatch each cycle
+      self.blockingInfo = [] # tracks why ready uops don't dispatch each cycle
 
    def isFull(self):
       return len(self.uops) + self.uArchConfig.issueWidth > self.uArchConfig.RSWidth
@@ -1370,6 +1368,9 @@ class InstrInstance:
       return laminatedDomainUops
 
 
+BlockingEvent = namedtuple('BlockingEvent', ['clock', 'uop', 'reason', 'details'], defaults=[{}])
+InstructionBlockingEvent = namedtuple('InstructionBlockingEvent', ['clock', 'instrInstance', 'reason', 'details'], defaults=[{}])
+
 def split64ByteBlockTo16ByteBlocks(cacheBlock):
    return [[ii for ii in cacheBlock if b*16 <= ii.address % 64 < (b+1)*16 ] for b in range(0,4)]
 
@@ -1486,8 +1487,6 @@ def canBeInDSB(block, DSBBlockSize):
    return True
 
 
-BlockingEvent = NamedTuple('BlockingEvent', [('clock', int), ('uop', 'Uop'), ('reason', str), ('details', Dict[str, Any])])
-InstructionBlockingEvent = NamedTuple('InstructionBlockingEvent', [('clock', int), ('instrInstance', 'InstrInstance'), ('reason', str), ('details', Dict[str, Any])])
 TableLineData = NamedTuple('TableLineData', [('string', str), ('instr', Optional[Instr]), ('url', Optional[str]), ('uopsForRnd', List[List[LaminatedUop]])])
 
 def getUopsTableColumns(tableLineData: List[TableLineData], uArchConfig: MicroArchConfig):
@@ -1842,7 +1841,28 @@ def generateHTMLGraph(filename, instructions, instrInstances: List[InstrInstance
    writeHtmlFile(filename, 'Graph', head, body, includeDOCTYPE=False) # if DOCTYPE is included, scaling doesn't work properly
 
 
-def generateJSONOutput(filename: str, instructions: List[Instr], frontEnd: FrontEnd, uArchConfig: MicroArchConfig, maxCycle: int, scheduler: 'Scheduler', renamer: 'Renamer'):
+def _groupAndDeduplicateBlockingEvents(events, maxCycle, getKey):
+   grouped = {}
+   for event in events:
+      if event.clock > maxCycle:
+         continue
+      key = getKey(event)
+      if key not in grouped:
+         grouped[key] = []
+      grouped[key].append((event.clock, event.reason, event.details))
+
+   deduplicated = {}
+   for key, eventList in grouped.items():
+      deduplicated[key] = []
+      lastReason = None
+      for clock, reason, details in eventList:
+         if reason != lastReason:
+            deduplicated[key].append((clock, reason, details))
+            lastReason = reason
+
+   return deduplicated
+
+def generateJSONOutput(filename, instructions, frontEnd, uArchConfig, maxCycle, scheduler, renamer):
    parameters = {
       'uArchName': uArchConfig.name,
       'IQWidth': uArchConfig.IQWidth,
@@ -1933,93 +1953,41 @@ def generateJSONOutput(filename: str, instructions: List[Instr], frontEnd: Front
                if (uop.executed is not None) and (uop.executed <= maxCycle):
                   cycles[uop.executed].setdefault('executed', []).append(unfusedUopDict)
 
-   # Process blocking information from scheduler
-   # Group by uop, then deduplicate consecutive same-reason events
-   uopBlockingEvents: Dict[Uop, List[Tuple[int, str, Dict[str, Any]]]] = {}
-   for event in scheduler.blockingInfo:
-      if event.clock > maxCycle:
-         continue
-      if event.uop not in uopBlockingEvents:
-         uopBlockingEvents[event.uop] = []
-      uopBlockingEvents[event.uop].append((event.clock, event.reason, event.details))
-
-   # Add to cycles, but only when reason changes from previous cycle
-   for uop, events in uopBlockingEvents.items():
+   # Process scheduler blocking events
+   for uop, events in _groupAndDeduplicateBlockingEvents(scheduler.blockingInfo, maxCycle, lambda e: e.uop).items():
       if uop not in unfusedUopToDict:
-         continue  # Uop might not be in the tracked range
-
-      lastReason = None
-      for clock, reason, details in events:
-         if reason != lastReason:
-            # Create blocking event dict based on uop's identity
-            blockingDict = unfusedUopToDict[uop].copy()
-            blockingDict['reason'] = reason
-
-            # Add details (port, etc.)
-            for key, value in details.items():
-               if key == 'dispatchedInstead':
-                  # Convert uop reference to dict
-                  if value in unfusedUopToDict:
-                     blockingDict['dispatchedInstead'] = unfusedUopToDict[value]
-               else:
-                  blockingDict[key] = value
-
-            cycles[clock].setdefault('blockedFromDispatch', []).append(blockingDict)
-            lastReason = reason
-
-   # Process issue blocking information from renamer
-   uopIssueBlockingEvents: Dict[Uop, List[Tuple[int, str, Dict[str, Any]]]] = {}
-   for event in renamer.blockingInfo:
-      if event.clock > maxCycle:
          continue
-      if event.uop not in uopIssueBlockingEvents:
-         uopIssueBlockingEvents[event.uop] = []
-      uopIssueBlockingEvents[event.uop].append((event.clock, event.reason, event.details))
-
-   # Add to cycles, but only when reason changes from previous cycle
-   for uop, events in uopIssueBlockingEvents.items():
-      if uop not in unfusedUopToDict:
-         continue  # Uop might not be in the tracked range
-
-      lastReason = None
       for clock, reason, details in events:
-         if reason != lastReason:
-            # Create blocking event dict based on uop's identity
-            blockingDict = unfusedUopToDict[uop].copy()
-            blockingDict['reason'] = reason
-
-            # Add details if any
-            for key, value in details.items():
+         blockingDict = unfusedUopToDict[uop].copy()
+         blockingDict['reason'] = reason
+         for key, value in details.items():
+            if key == 'dispatchedInstead' and value in unfusedUopToDict:
+               blockingDict['dispatchedInstead'] = unfusedUopToDict[value]
+            else:
                blockingDict[key] = value
+         cycles[clock].setdefault('blockedFromDispatch', []).append(blockingDict)
 
-            cycles[clock].setdefault('blockedFromIssue', []).append(blockingDict)
-            lastReason = reason
-
-   # Process front-end blocking information
-   # Group by instruction instance, then deduplicate consecutive same-reason events
-   instrBlockingEvents: Dict['InstrInstance', List[Tuple[int, str, Dict[str, Any]]]] = {}
-   for event in frontEnd.blockingInfo:
-      if event.clock > maxCycle:
+   # Process renamer blocking events
+   for uop, events in _groupAndDeduplicateBlockingEvents(renamer.blockingInfo, maxCycle, lambda e: e.uop).items():
+      if uop not in unfusedUopToDict:
          continue
-      if event.instrInstance not in instrBlockingEvents:
-         instrBlockingEvents[event.instrInstance] = []
-      instrBlockingEvents[event.instrInstance].append((event.clock, event.reason, event.details))
+      for clock, reason, details in events:
+         blockingDict = unfusedUopToDict[uop].copy()
+         blockingDict['reason'] = reason
+         for key, value in details.items():
+            blockingDict[key] = value
+         cycles[clock].setdefault('blockedFromIssue', []).append(blockingDict)
 
-   # Add to cycles, but only when reason changes from previous cycle
-   for instrI, events in instrBlockingEvents.items():
+   # Process front-end blocking events
+   for instrI, events in _groupAndDeduplicateBlockingEvents(frontEnd.blockingInfo, maxCycle, lambda e: e.instrInstance).items():
       instrID = instrToID[instrI.instr]
       rnd = instrI.rnd
-      lastReason = None
       for clock, reason, details in events:
-         if reason != lastReason:
-            blockingDict = {'instrID': instrID, 'rnd': rnd}
-            blockingDict['reason'] = reason
-            for key, value in details.items():
-               blockingDict[key] = value
-            cycles[clock].setdefault('blockedFromDecode', []).append(blockingDict)
-            lastReason = reason
+         blockingDict = {'instrID': instrID, 'rnd': rnd, 'reason': reason}
+         for key, value in details.items():
+            blockingDict[key] = value
+         cycles[clock].setdefault('blockedFromDecode', []).append(blockingDict)
 
-   import json
    jsonStr = json.dumps({'parameters': parameters, 'instructions': instrList, 'cycles': cycles}, sort_keys=True)
 
    with open(filename, 'w') as f:
