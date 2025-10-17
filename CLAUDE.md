@@ -110,3 +110,20 @@ No formal test suite. Test by running on known basic blocks and comparing with h
 ## Architecture-Specific Data
 
 After setup, instrData/ contains generated modules like SKL_data.py with per-instruction performance data (ports, latencies, uop counts) measured from real CPUs.
+
+## Python Style Notes
+
+### Compatibility
+- Maintain Python 3.6+ compatibility for upstream contributions
+- Avoid features requiring 3.7+ (f-strings OK, namedtuple defaults not OK)
+- Type hints use `typing` module syntax compatible with 3.5+
+
+### Import Style
+- **Unusual but consistent**: `json` is imported locally within functions rather than at module level
+- When adding code that uses json, follow this pattern (see `generateJSONOutput()` and `generateHTMLOutput()`)
+- Standard library imports at top as usual (argparse, os, re, etc.)
+- Third-party imports separated (xed, plotly)
+
+### Code Organization
+- namedtuples defined immediately before the class/function that uses them
+- No defaults parameter in namedtuples (Python 3.7+ only)
