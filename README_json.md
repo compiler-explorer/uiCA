@@ -2,6 +2,8 @@
 
 uiCA can output detailed cycle-by-cycle simulation data using `-json <filename>`. This gives you everything you need to visualize or analyze the pipeline behavior programmatically.
 
+**Important:** To get blocking/stall diagnostics, use `-trackBlocking` along with `-json`. Without this flag, blocking events won't be collected (for performance reasons).
+
 ## Overview
 
 The JSON has three top-level sections:
@@ -27,11 +29,14 @@ Contains the microarchitecture configuration:
   "allPorts": ["0", "1", "2", "3", "4", "5", "6", "7"],
   "LSD": false,
   "LSDUnrollCount": 1,
-  "mode": "loop"
+  "mode": "loop",
+  "blockingTracked": true
 }
 ```
 
 The queue widths (IDQ, RB, RS) are useful for understanding resource pressure. The `mode` is either "loop" (simulated as a loop) or "unroll" (simulated as straight-line code).
+
+**`blockingTracked`** tells you whether blocking/stall events were collected. If `false`, the absence of `blockedFrom*` events doesn't mean nothing was blocked - it means tracking was disabled for performance.
 
 ## Instructions
 
@@ -85,6 +90,11 @@ Here's what can happen each cycle:
 - `executed` - Unfused uops that completed execution
 - `removedFromRB` - Fused uops retiring from the reorder buffer
 
+**Blocking/stall diagnostics (requires `-trackBlocking`):**
+- `blockedFromDecode` - Instructions that couldn't decode (e.g., IDQ full)
+- `blockedFromIssue` - Uops that couldn't issue from renamer (e.g., issue width exceeded, RB/RS full)
+- `blockedFromDispatch` - Uops ready but couldn't dispatch to ports (e.g., port busy, resource blocked)
+
 ### Understanding Dependencies
 
 The `addedToRS` event includes a `dependsOn` array that shows what this uop is waiting for:
@@ -124,6 +134,27 @@ Example timeline:
 - Cycle 17: `addedToRS` with 1 dependency
 - Cycle 24: `readyForDispatch` (dependency satisfied after 7 cycles)
 - Cycle 27: `executed` (waited 3 cycles for port availability)
+
+### Blocking Events (with `-trackBlocking`)
+
+When tracking is enabled, you get detailed reasons for stalls:
+
+**`blockedFromDispatch`** entries include a `reason` field:
+- `port_busy_older_uop` - Port busy with an older uop (includes `dispatchedInstead` showing which uop got the port)
+- `port_blocked_resource` - Port temporarily blocked by resource constraint
+- `port_removed_by_constraint` - Uop can't use this port due to constraint
+
+**`blockedFromIssue`** entries include a `reason` field:
+- `register_merge_required` - Waiting for register merge uops
+- `serializing_instruction_waiting` - Serializing instruction waiting for ROB to drain
+- `issue_width_exceeded` - Issue width limit reached
+- `reorder_buffer_full` - Reorder buffer full
+- `reservation_station_full` - Reservation station full
+
+**`blockedFromDecode`** entries include a `reason` field:
+- `idq_full` - Instruction decode queue full (includes current `idqSize`)
+
+These events let you pinpoint exactly why pipeline progress stalled each cycle.
 
 ### Dispatched Events
 
