@@ -142,11 +142,12 @@ class RenamedOperand:
 
 RenameDictEntry = namedtuple('RenameDictEntry', ['renamedOp', 'renamedByElim32BitMove'])
 class Renamer:
-   def __init__(self, IDQ, reorderBuffer, uArchConfig: MicroArchConfig, initPolicy):
+   def __init__(self, IDQ, reorderBuffer, uArchConfig: MicroArchConfig, initPolicy, trackBlocking=False):
       self.IDQ = IDQ
       self.reorderBuffer = reorderBuffer
       self.uArchConfig = uArchConfig
       self.absValGen = AbstractValueGenerator(initPolicy)
+      self.trackBlocking = trackBlocking
 
       self.renameDict = {}
 
@@ -168,6 +169,7 @@ class Renamer:
       self.storeBufferEntryDict = {}
 
       self.lastRegMergeIssued = None # last uop for which register merge uops were issued
+      self.blockingInfo = [] # tracks why uops in IDQ don't issue each cycle
 
    def cycle(self):
       self.renamerActiveCycle += 1
@@ -187,12 +189,28 @@ class Renamer:
                   renamerUops.append(mergeUop)
                   firstUnfusedUop.instrI.regMergeUops.append(LaminatedUop([mergeUop]))
                self.lastRegMergeIssued = firstUnfusedUop
+               # Record that remaining IDQ uops blocked by register merge requirement
+               if self.trackBlocking:
+                  for lamUop in self.IDQ:
+                     for uop in lamUop.getUnfusedUops():
+                        self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'register_merge_required', {}))
                break
 
          if firstUnfusedUop.prop.isFirstUopOfInstr and firstUnfusedUop.prop.instr.isSerializingInstr and not self.reorderBuffer.isEmpty():
+            # Record that this serializing instruction is blocked
+            if self.trackBlocking:
+               for uop in lamUop.getUnfusedUops():
+                  self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'serializing_instruction_waiting', {}))
             break
          fusedUops = lamUop.getFusedUops()
          if len(renamerUops) + len(fusedUops) > self.uArchConfig.issueWidth:
+            # Record that this lamUop and all remaining IDQ uops blocked by issue width
+            if self.trackBlocking:
+               for uop in lamUop.getUnfusedUops():
+                  self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded', {}))
+               for remainingLamUop in list(self.IDQ)[1:]:  # Skip first (already handled)
+                  for uop in remainingLamUop.getUnfusedUops():
+                     self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded', {}))
             break
          renamerUops.extend(fusedUops)
          self.IDQ.popleft()
@@ -348,15 +366,17 @@ class Renamer:
 
 class FrontEnd:
    def __init__(self, instructions: List[Instr], reorderBuffer, scheduler, uArchConfig: MicroArchConfig,
-                unroll, alignmentOffset, initPolicy, perfEvents, simpleFrontEnd=False):
+                unroll, alignmentOffset, initPolicy, perfEvents, simpleFrontEnd=False, trackBlocking=False):
       self.IDQ = deque()
-      self.renamer = Renamer(self.IDQ, reorderBuffer, uArchConfig, initPolicy)
+      self.renamer = Renamer(self.IDQ, reorderBuffer, uArchConfig, initPolicy, trackBlocking)
       self.reorderBuffer = reorderBuffer
       self.scheduler = scheduler
       self.uArchConfig = uArchConfig
       self.unroll = unroll
       self.alignmentOffset = alignmentOffset
       self.perfEvents = perfEvents
+      self.trackBlocking = trackBlocking
+      self.blockingInfo = [] # tracks why instructions can't be decoded each cycle
 
       self.MS = MicrocodeSequencer(self.uArchConfig)
 
@@ -408,6 +428,13 @@ class FrontEnd:
       issueUops = []
       if not self.reorderBuffer.isFull() and not self.scheduler.isFull(): # len(self.IDQ) >= uArchConfig.issueWidth and the first check seems to be wrong, but leads to better results
          issueUops = self.renamer.cycle()
+      else:
+         # Record all uops in IDQ as blocked by RB or RS full
+         if self.trackBlocking:
+            reason = 'reorder_buffer_full' if self.reorderBuffer.isFull() else 'reservation_station_full'
+            for lamUop in self.IDQ:
+               for uop in lamUop.getUnfusedUops():
+                  self.renamer.blockingInfo.append(BlockingEvent(clock, uop, reason, {}))
 
       for fusedUop in issueUops:
          fusedUop.issued = clock
@@ -424,6 +451,10 @@ class FrontEnd:
 
       if len(self.IDQ) + self.uArchConfig.DSBWidth > self.uArchConfig.IDQWidth:
          self.perfEvents.setdefault(clock, {})['IDQFull'] = 1
+         # Record all instructions in instruction queue as blocked from decode
+         if self.trackBlocking:
+            for instrI in self.instructionQueue:
+               self.blockingInfo.append(InstructionBlockingEvent(clock, instrI, 'idq_full', {'idqSize': len(self.IDQ)}))
          return
 
       if self.uopSource is None:
@@ -811,8 +842,9 @@ class ReorderBuffer:
 
 
 class Scheduler:
-   def __init__(self, uArchConfig: MicroArchConfig):
+   def __init__(self, uArchConfig: MicroArchConfig, trackBlocking=False):
       self.uArchConfig = uArchConfig
+      self.trackBlocking = trackBlocking
       self.uops = set()
       self.portUsage = {p:0  for p in allPorts[self.uArchConfig.name]}
       self.portUsageAtStartOfCycle = {}
@@ -832,6 +864,7 @@ class Scheduler:
       self.blockedResources = dict() # for how many remaining cycle a resource will be blocked
       self.blockedResources['div'] = 0
       self.dependentUops = dict() # uops that have an operand that is written by a non-executed uop
+      self.blockingInfo = [] # tracks why ready uops don't dispatch each cycle
 
    def isFull(self):
       return len(self.uops) + self.uArchConfig.issueWidth > self.uArchConfig.RSWidth
@@ -880,6 +913,10 @@ class Scheduler:
                and ((not self.readyQueue['0']) or self.readyDivUops[0][0] < self.readyQueue['0'][0][0])):
             queue = self.readyDivUops
          if self.blockedResources.get('port' + port):
+            # Record all uops in this port's queue as blocked by resource
+            if self.trackBlocking:
+               for _, uop in queue:
+                  self.blockingInfo.append(BlockingEvent(clock, uop, 'port_blocked_resource', {'port': port}))
             continue
          if not queue:
             continue
@@ -891,9 +928,25 @@ class Scheduler:
          uopsDispatched.append(uop)
          self.pendingUops.add(uop)
 
+         # Record that remaining uops in queue were passed over by an older uop
+         if self.trackBlocking:
+            for _, remaining_uop in queue:
+               self.blockingInfo.append(BlockingEvent(clock, remaining_uop, 'port_busy_older_uop', {
+                  'port': port,
+                  'dispatchedInstead': uop
+               }))
+
          self.blockedResources['div'] += uop.prop.divCycles
          if self.uArchConfig.slow256BitMemAcc and (port == '4') and ('M256' in uop.instrI.instr.instrStr):
             self.blockedResources['port' + port] = 2
+
+      # Check for uops on ports that were removed from applicablePorts
+      if self.trackBlocking:
+         allPortsList = list(allPorts[self.uArchConfig.name])
+         for port in allPortsList:
+            if port not in applicablePorts:
+               for _, uop in self.readyQueue[port]:
+                  self.blockingInfo.append(BlockingEvent(clock, uop, 'port_removed_by_constraint', {'port': port}))
 
       for uop in self.uopsDispatchedInPrevCycle:
          self.portUsage[uop.actualPort] -= 1
@@ -1324,6 +1377,9 @@ class InstrInstance:
 
       return laminatedDomainUops
 
+
+BlockingEvent = namedtuple('BlockingEvent', ['clock', 'uop', 'reason', 'details'])
+InstructionBlockingEvent = namedtuple('InstructionBlockingEvent', ['clock', 'instrInstance', 'reason', 'details'])
 
 def split64ByteBlockTo16ByteBlocks(cacheBlock):
    return [[ii for ii in cacheBlock if b*16 <= ii.address % 64 < (b+1)*16 ] for b in range(0,4)]
@@ -1795,7 +1851,31 @@ def generateHTMLGraph(filename, instructions, instrInstances: List[InstrInstance
    writeHtmlFile(filename, 'Graph', head, body, includeDOCTYPE=False) # if DOCTYPE is included, scaling doesn't work properly
 
 
-def generateJSONOutput(filename, instructions: List[Instr], frontEnd: FrontEnd, uArchConfig: MicroArchConfig, maxCycle):
+def _groupAndDeduplicateBlockingEvents(events, maxCycle, getKey):
+   grouped = {}
+   for event in events:
+      if event.clock > maxCycle:
+         continue
+      key = getKey(event)
+      if key not in grouped:
+         grouped[key] = []
+      grouped[key].append((event.clock, event.reason, event.details))
+
+   deduplicated = {}
+   for key, eventList in grouped.items():
+      deduplicated[key] = []
+      lastReason = None
+      lastDetails = None
+      for clock, reason, details in eventList:
+         if reason != lastReason or details != lastDetails:
+            deduplicated[key].append((clock, reason, details))
+            lastReason = reason
+            lastDetails = details
+
+   return deduplicated
+
+def generateJSONOutput(filename, instructions, frontEnd, uArchConfig, maxCycle, scheduler, renamer, trackBlocking):
+   import json
    parameters = {
       'uArchName': uArchConfig.name,
       'IQWidth': uArchConfig.IQWidth,
@@ -1808,7 +1888,8 @@ def generateJSONOutput(filename, instructions: List[Instr], frontEnd: FrontEnd, 
       'DSBBlockSize': uArchConfig.DSBBlockSize,
       'LSD': (frontEnd.uopSource == 'LSD'),
       'LSDUnrollCount': frontEnd.LSDUnrollCount,
-      'mode': 'unroll' if frontEnd.unroll else 'loop'
+      'mode': 'unroll' if frontEnd.unroll else 'loop',
+      'blockingTracked': trackBlocking
    }
 
    instrList = []
@@ -1886,7 +1967,41 @@ def generateJSONOutput(filename, instructions: List[Instr], frontEnd: FrontEnd, 
                if (uop.executed is not None) and (uop.executed <= maxCycle):
                   cycles[uop.executed].setdefault('executed', []).append(unfusedUopDict)
 
-   import json
+   # Process scheduler blocking events
+   for uop, events in _groupAndDeduplicateBlockingEvents(scheduler.blockingInfo, maxCycle, lambda e: e.uop).items():
+      if uop not in unfusedUopToDict:
+         continue
+      for clock, reason, details in events:
+         blockingDict = unfusedUopToDict[uop].copy()
+         blockingDict['reason'] = reason
+         for key, value in details.items():
+            if key == 'dispatchedInstead' and value in unfusedUopToDict:
+               blockingDict['dispatchedInstead'] = unfusedUopToDict[value]
+            else:
+               blockingDict[key] = value
+         cycles[clock].setdefault('blockedFromDispatch', []).append(blockingDict)
+
+   # Process renamer blocking events
+   for uop, events in _groupAndDeduplicateBlockingEvents(renamer.blockingInfo, maxCycle, lambda e: e.uop).items():
+      if uop not in unfusedUopToDict:
+         continue
+      for clock, reason, details in events:
+         blockingDict = unfusedUopToDict[uop].copy()
+         blockingDict['reason'] = reason
+         for key, value in details.items():
+            blockingDict[key] = value
+         cycles[clock].setdefault('blockedFromIssue', []).append(blockingDict)
+
+   # Process front-end blocking events
+   for instrI, events in _groupAndDeduplicateBlockingEvents(frontEnd.blockingInfo, maxCycle, lambda e: e.instrInstance).items():
+      instrID = instrToID[instrI.instr]
+      rnd = instrI.rnd
+      for clock, reason, details in events:
+         blockingDict = {'instrID': instrID, 'rnd': rnd, 'reason': reason}
+         for key, value in details.items():
+            blockingDict[key] = value
+         cycles[clock].setdefault('blockedFromDecode', []).append(blockingDict)
+
    jsonStr = json.dumps({'parameters': parameters, 'instructions': instrList, 'cycles': cycles}, sort_keys=True)
 
    with open(filename, 'w') as f:
@@ -1902,7 +2017,7 @@ def getURL(instrStr):
 
 # Returns the throughput
 def runSimulation(disas, uArchConfig: MicroArchConfig, alignmentOffset, initPolicy, noMicroFusion, noMacroFusion, simpleFrontEnd, minIterations, minCycles,
-                  printDetails=False, traceFile=None, graphFile=None, depGraphFile=None, jsonFile=None):
+                  printDetails=False, traceFile=None, graphFile=None, depGraphFile=None, jsonFile=None, trackBlocking=False):
    instructions = getInstructions(disas, uArchConfig, importlib.import_module('instrData.'+uArchConfig.name+'_data'),
                                   alignmentOffset, noMicroFusion, noMacroFusion)
    if not instructions:
@@ -1914,11 +2029,11 @@ def runSimulation(disas, uArchConfig: MicroArchConfig, alignmentOffset, initPoli
 
    retireQueue = deque()
    rb = ReorderBuffer(retireQueue, uArchConfig)
-   scheduler = Scheduler(uArchConfig)
+   scheduler = Scheduler(uArchConfig, trackBlocking)
 
    perfEvents: Dict[int, Dict[str, int]] = {}
    unroll = (not instructions[-1].isBranchInstr)
-   frontEnd = FrontEnd(instructions, rb, scheduler, uArchConfig, unroll, alignmentOffset, initPolicy, perfEvents, simpleFrontEnd)
+   frontEnd = FrontEnd(instructions, rb, scheduler, uArchConfig, unroll, alignmentOffset, initPolicy, perfEvents, simpleFrontEnd, trackBlocking)
 
    clock = 0
    rnd = 0
@@ -2003,7 +2118,7 @@ def runSimulation(disas, uArchConfig: MicroArchConfig, alignmentOffset, initPoli
       generateGraphvizOutputForLatencyGraph(instructions, nodesForInstr, edgesForNode, edgesOnMaxCycle, comp, depGraphFile)
 
    if jsonFile is not None:
-      generateJSONOutput(jsonFile, instructions, frontEnd, uArchConfig, clock-1)
+      generateJSONOutput(jsonFile, instructions, frontEnd, uArchConfig, clock-1, scheduler, frontEnd.renamer, trackBlocking)
 
    return TP
 
@@ -2029,6 +2144,7 @@ def main():
    parser.add_argument('-minCycles', help='Simulate at least this many cycles; default: 500', type=int, default=500)
    parser.add_argument('-json', help='JSON output', nargs='?', const='result.json')
    parser.add_argument('-depGraph', help='Output the dependency graph; the format is determined by the filename extension', nargs='?', const='dep.svg')
+   parser.add_argument('-trackBlocking', help='Track blocking events (may impact performance)', action='store_true')
    parser.add_argument('-initPolicy', help='Initial register state; '
                                            'options: "diff" (all registers initially have different values), '
                                            '"same" (they all have the same value), '
@@ -2087,7 +2203,7 @@ def main():
          print('    - {:.2f} otherwise\n'.format(sortedTP[-1][0], sortedTP[-1][1]))
    else:
       TP = runSimulation(disas, uArchConfig, int(args.alignmentOffset), args.initPolicy, args.noMicroFusion, args.noMacroFusion, args.simpleFrontEnd,
-                         args.minIterations, args.minCycles, not args.TPonly, args.trace, args.graph, args.depGraph, args.json)
+                         args.minIterations, args.minCycles, not args.TPonly, args.trace, args.graph, args.depGraph, args.json, args.trackBlocking)
       if args.TPonly:
          print('{:.2f}'.format(TP))
 
