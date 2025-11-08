@@ -60,6 +60,43 @@ code {
 .cycleHeader:nth-child(even)::before {
     background-color: white;
 }
+
+.blocked-cell {
+    border: 2px dotted #ff6b6b !important;
+    cursor: help;
+    position: relative;
+}
+
+.blocked-cell[data-tooltip]:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background-color: #333;
+    color: #fff;
+    padding: 8px 12px;
+    border-radius: 4px;
+    white-space: pre-line;
+    font-size: 13px;
+    z-index: 1000;
+    min-width: 200px;
+    text-align: left;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    margin-bottom: 5px;
+}
+
+.blocked-cell[data-tooltip]:hover::before {
+    content: '';
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: #333;
+    z-index: 1000;
+    margin-bottom: -1px;
+}
 </style>
 
 <script>
@@ -73,6 +110,41 @@ var eventToColor = {
     "D": "Orange",
     "E": "Yellow",
     "R": "ForestGreen",
+}
+
+var eventNames = {
+    "P": "Predecoded",
+    "Q": "Added to IDQ",
+    "I": "Issued",
+    "r": "Ready for dispatch",
+    "D": "Dispatched",
+    "E": "Executed",
+    "R": "Retired"
+}
+
+function formatBlockingReason(reason, stallType) {
+    var reasonMap = {
+        'ms_post_stall': 'MS post-stall cleanup',
+        'ms_stalled': stallType === 'pre_stall' ? 'MS pre-stall (initializing)' : 'MS delivering (stalled)',
+        'port_busy_older_uop': 'Port busy with older uop',
+        'port_blocked_resource': 'Port blocked by resource',
+        'port_removed_by_constraint': 'Port removed by constraint',
+        'register_merge_required': 'Waiting for register merge',
+        'serializing_instruction_waiting': 'Serializing instruction waiting',
+        'issue_width_exceeded': 'Issue width limit reached',
+        'reorder_buffer_full': 'Reorder buffer full',
+        'reservation_station_full': 'Reservation station full',
+        'idq_full': 'IDQ full'
+    }
+    return reasonMap[reason] || reason.replace(/_/g, ' ')
+}
+
+function formatTooltip(blocking) {
+    var lines = []
+    lines.push('Blocked at ' + blocking.stage)
+    lines.push('Reason: ' + formatBlockingReason(blocking.reason, blocking.stallType))
+    lines.push('Waiting for: ' + eventNames[blocking.waitingFor])
+    return lines.join('\n')
 }
 
 function createTable() {
@@ -135,10 +207,62 @@ function createTable() {
 
                     events = Object.entries(uop.events)
                     for (let j = 0; j < events.length; j++) {
-                        tableHtml += '<td style="background-color:' + eventToColor[events[j][1]] + '">' + events[j][1] + '</td>'
+                        var cycle = events[j][0]
+                        var event = events[j][1]
+                        var cellClass = ''
+                        var tooltip = ''
+
+                        // Check for blocking information at this cycle
+                        if (uop.blocking && uop.blocking[cycle]) {
+                            cellClass = ' class="blocked-cell"'
+                            tooltip = ' data-tooltip="' + formatTooltip(uop.blocking[cycle]) + '"'
+                        }
+
+                        tableHtml += '<td' + cellClass + tooltip + ' style="background-color:' + eventToColor[event] + '">' + event + '</td>'
+
+                        // Handle gap between this event and next
                         if ((j < events.length - 1) && (Number(events[j+1][0]) > Number(events[j][0]) + 1)) {
-                            bg = `background-image: linear-gradient(to right, ${eventToColor[events[j][1]]} , ${eventToColor[events[j+1][1]]})`
-                            tableHtml += '<td style="' + bg + '" colspan="' + (Number(events[j+1][0]) - Number(events[j][0]) - 1) + '"></td>'
+                            var gapStart = Number(events[j][0]) + 1
+                            var gapEnd = Number(events[j+1][0]) - 1
+
+                            // Check if any cycles in the gap have blocking info
+                            var hasBlocking = false
+                            if (uop.blocking) {
+                                for (let c = gapStart; c <= gapEnd; c++) {
+                                    if (uop.blocking[c]) {
+                                        hasBlocking = true
+                                        break
+                                    }
+                                }
+                            }
+
+                            if (hasBlocking) {
+                                // Render cells with colspan for non-blocking, individual cells for blocking
+                                let c = gapStart;
+                                while (c <= gapEnd) {
+                                    if (uop.blocking && uop.blocking[c]) {
+                                        // This cycle has blocking, create individual cell
+                                        var gapCellClass = ' class="blocked-cell"'
+                                        var gapTooltip = ' data-tooltip="' + formatTooltip(uop.blocking[c]) + '"'
+                                        bg = `background-image: linear-gradient(to right, ${eventToColor[events[j][1]]} , ${eventToColor[events[j+1][1]]})`
+                                        tableHtml += '<td' + gapCellClass + gapTooltip + ' style="' + bg + '"></td>'
+                                        c++;
+                                    } else {
+                                        // Find how many consecutive non-blocking cycles
+                                        let nonBlockingStart = c;
+                                        while (c <= gapEnd && (!uop.blocking || !uop.blocking[c])) {
+                                            c++;
+                                        }
+                                        let nonBlockingCount = c - nonBlockingStart;
+                                        bg = `background-image: linear-gradient(to right, ${eventToColor[events[j][1]]} , ${eventToColor[events[j+1][1]]})`
+                                        tableHtml += '<td style="' + bg + '" colspan="' + nonBlockingCount + '"></td>'
+                                    }
+                                }
+                            } else {
+                                // No blocking, use single colspan cell as before
+                                bg = `background-image: linear-gradient(to right, ${eventToColor[events[j][1]]} , ${eventToColor[events[j+1][1]]})`
+                                tableHtml += '<td style="' + bg + '" colspan="' + (gapEnd - gapStart + 1) + '"></td>'
+                            }
                         }
                     }
                     if (maxUopCycle - minCycle < maxCycle - minCycle) {
@@ -167,12 +291,13 @@ $(document).ready(function() {
     createLegend()
 
     var slider = document.getElementById('slider')
+    var maxIteration = Math.max(1, tableData.length-1)  // Ensure max > min for noUiSlider
     noUiSlider.create(slider, {
-        start: [0, Math.min(50, tableData.length-1)],
+        start: [0, Math.min(50, maxIteration)],
         connect: true,
         range: {
             'min': 0,
-            'max': tableData.length-1
+            'max': maxIteration
         },
         tooltips: true,
         format: wNumb({

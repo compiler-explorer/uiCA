@@ -1725,8 +1725,20 @@ def writeHtmlFile(filename, title, head, body, includeDOCTYPE=True):
               '</html>\n')
 
 
-def generateHTMLTraceTable(filename, instructions, instrInstances, lastRelevantRound, maxCycle):
+def generateHTMLTraceTable(filename, instructions, instrInstances, lastRelevantRound, maxCycle, frontEnd, scheduler, renamer, trackBlocking):
    import json
+
+   # Process blocking events if tracking enabled
+   dispatchBlocking = {}
+   issueBlocking = {}
+   idqDeliveryBlocking = {}
+   decodeBlocking = {}
+
+   if trackBlocking:
+      dispatchBlocking = _groupAndDeduplicateBlockingEvents(scheduler.blockingInfo, maxCycle, lambda e: e.uop)
+      issueBlocking = _groupAndDeduplicateBlockingEvents(renamer.blockingInfo, maxCycle, lambda e: e.uop)
+      idqDeliveryBlocking = _groupAndDeduplicateBlockingEvents(frontEnd.frontEndUopBlockingInfo, maxCycle, lambda e: e.lamUop)
+      decodeBlocking = _groupAndDeduplicateBlockingEvents(frontEnd.blockingInfo, maxCycle, lambda e: e.instrInstance)
 
    tableDataForRnd = []
    prevRnd = -1
@@ -1765,6 +1777,7 @@ def generateHTMLTraceTable(filename, instructions, instrInstances, lastRelevantR
             if preDec:
                uopData['events'][preDec] = 'P'
          else:
+            prevLamUop = None
             for uopI, uop in enumerate(uops):
                uopData = {}
                tableDataForRnd[-1][-1]['uops'].append(uopData)
@@ -1780,6 +1793,51 @@ def generateHTMLTraceTable(filename, instructions, instrInstances, lastRelevantR
                                    ]:
                   if (evCycle is not None) and (evCycle >= 0) and (evCycle <= maxCycle):
                      uopData['events'][evCycle] = ev
+
+               # Add blocking information if tracking enabled
+               if trackBlocking:
+                  uopData['blocking'] = {}
+                  lamUop = uop.fusedUop.laminatedUop
+                  isFirstUopInLamUop = (lamUop != prevLamUop)
+                  prevLamUop = lamUop
+
+                  # Dispatch blocking
+                  if uop in dispatchBlocking:
+                     for clock, reason, details in dispatchBlocking[uop]:
+                        uopData['blocking'][clock] = {
+                           'stage': 'dispatch',
+                           'reason': reason,
+                           'waitingFor': 'D'
+                        }
+
+                  # Issue blocking
+                  if uop in issueBlocking:
+                     for clock, reason, details in issueBlocking[uop]:
+                        uopData['blocking'][clock] = {
+                           'stage': 'issue',
+                           'reason': reason,
+                           'waitingFor': 'I'
+                        }
+
+                  # IDQ delivery blocking (at lamUop level, only for first uop of each laminated uop)
+                  if lamUop in idqDeliveryBlocking and isFirstUopInLamUop:
+                     for clock, reason, details in idqDeliveryBlocking[lamUop]:
+                        uopData['blocking'][clock] = {
+                           'stage': 'idq_delivery',
+                           'reason': reason,
+                           'waitingFor': 'Q',
+                           'stallType': details.get('stallType', '')
+                        }
+
+                  # Decode blocking (at instruction level, only for first uop)
+                  if instrI in decodeBlocking and uopI == 0:
+                     for clock, reason, details in decodeBlocking[instrI]:
+                        uopData['blocking'][clock] = {
+                           'stage': 'decode',
+                           'reason': reason,
+                           'waitingFor': 'P'
+                        }
+
       prevInstrI = instrI
 
    with open(os.path.join(os.path.dirname(os.path.realpath(__file__)), 'traceTemplate.html'), 'r') as t:
@@ -2283,7 +2341,7 @@ def runSimulation(disas, uArchConfig: MicroArchConfig, alignmentOffset, initPoli
 
    if traceFile is not None:
       #ToDo: use TableLineData instead
-      generateHTMLTraceTable(traceFile, instructions, frontEnd.allGeneratedInstrInstances, lastRelevantRound, clock-1)
+      generateHTMLTraceTable(traceFile, instructions, frontEnd.allGeneratedInstrInstances, lastRelevantRound, clock-1, frontEnd, scheduler, frontEnd.renamer, trackBlocking)
 
    if graphFile is not None:
       generateHTMLGraph(graphFile, instructions, frontEnd.allGeneratedInstrInstances, uArchConfig, clock-1)
