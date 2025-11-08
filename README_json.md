@@ -189,3 +189,181 @@ To visualize a uop's journey through the pipeline, search for its (instrID, rnd)
 - `addedToIDQ` and `removedFromIDQ` → front-end pressure
 
 The simulation runs for multiple iterations, so comparing the timing across different values of `rnd` can reveal how steady-state performance differs from initial behavior.
+
+---
+
+# Timeline JSON Format (`-timeline`)
+
+uiCA also offers a **uop-oriented timeline format** using `-timeline <filename>`. This format is designed for easier programmatic access to "what happened to uop X in cycle Y" questions, making it simpler to build UIs that display pipeline behavior without requiring deep knowledge of Intel's pipeline internals.
+
+**Important:** Like `-json`, use `-trackBlocking` with `-timeline` to get blocking/stall diagnostics.
+
+## Key Differences from `-json`
+
+The standard `-json` format is **cycle-oriented** (arrays of events per cycle), while `-timeline` is **uop-oriented** (each uop has a sparse event timeline). This makes it easier to:
+
+- Display a table with one row per uop (like the HTML trace output)
+- Query "what state is uop X in during cycle Y?"
+- Show tooltips explaining why a uop didn't advance
+- Avoid needing to understand which pipeline stage an event represents
+
+## Overview
+
+The timeline JSON has four top-level sections:
+
+- `eventCodes` - Legend explaining single-letter event codes
+- `parameters` - CPU configuration (same as `-json`)
+- `instructions` - List of instructions (same as `-json`)
+- `uops` - Array of uops, each with a sparse timeline
+
+## Event Codes
+
+The `eventCodes` section provides a legend for the single-letter codes used in uop timelines:
+
+```json
+{
+  "P": "Predecoded",
+  "Q": "Added to IDQ",
+  "I": "Issued",
+  "r": "Ready for dispatch",
+  "D": "Dispatched",
+  "E": "Executed",
+  "R": "Retired"
+}
+```
+
+These represent the major pipeline stages a uop goes through from decode to retirement.
+
+## Uops Structure
+
+Each uop is an object containing:
+
+- Identification: `instrID`, `rnd`, `lamUopID`, `fUopID`, `uopID`
+- Port information: `possiblePorts` (array), `actualPort` (string or null)
+- Timeline: `events` (dict mapping cycle → event)
+
+```json
+{
+  "instrID": 0,
+  "rnd": 0,
+  "lamUopID": 3,
+  "fUopID": 0,
+  "uopID": 0,
+  "possiblePorts": ["0", "1", "5", "6"],
+  "actualPort": "5",
+  "events": {
+    "0": "P",
+    "4": {"event": "blocked", "reason": "ms_stalled", "stage": "idq_delivery", "stallType": "pre_stall", "waitingFor": "Q"},
+    "5": "Q",
+    "6": "I",
+    "11": "D",
+    "13": "E",
+    "36": "R"
+  }
+}
+```
+
+### Reading the Timeline
+
+The `events` dict is **sparse** - only cycles where something happened appear. For most cycles, a single letter indicates the pipeline stage:
+
+- Cycle 0: `"P"` - Uop was predecoded
+- Cycle 5: `"Q"` - Uop added to IDQ (decode queue)
+- Cycle 6: `"I"` - Uop issued from renamer
+- Cycle 11: `"D"` - Uop dispatched to port 5
+- Cycle 13: `"E"` - Uop executed
+- Cycle 36: `"R"` - Uop retired
+
+Between these events, the uop remains in the previous state (e.g., from cycle 6-10 it's in the "issued" state waiting in the reservation station).
+
+### Blocking Events
+
+When `-trackBlocking` is enabled, cycles where a uop is **blocked** show an object instead of a single letter:
+
+```json
+{
+  "event": "blocked",
+  "stage": "idq_delivery",
+  "reason": "ms_stalled",
+  "waitingFor": "Q",
+  "stallType": "pre_stall"
+}
+```
+
+The `waitingFor` field tells you which event code this uop is blocked from achieving.
+
+**Common blocking reasons:**
+
+**At decode stage (`waitingFor: "P"`):**
+- `ms_post_stall` - Instruction can't decode because microcode sequencer is in cleanup phase
+
+**At IDQ delivery (`waitingFor: "Q"`):**
+- `ms_stalled` - Uop waiting in MS queue during stall phase
+  - `stallType: "pre_stall"` - MS initializing (switching from MITE to MS)
+  - `stallType: "post_stall"` - MS cleaning up (not applicable to IDQ delivery)
+
+**At issue stage (`waitingFor: "I"`):**
+- `register_merge_required` - Waiting for register merge uops
+- `serializing_instruction_waiting` - Serializing instruction waiting for ROB to drain
+- `issue_width_exceeded` - Issue width limit reached
+- `reorder_buffer_full` - Reorder buffer full
+- `reservation_station_full` - Reservation station full
+
+**At dispatch stage (`waitingFor: "D"`):**
+- `port_busy_older_uop` - Port busy with an older uop (includes `port` field)
+- `port_blocked_resource` - Port temporarily blocked by resource constraint (includes `port` field)
+- `port_removed_by_constraint` - Uop can't use this port due to constraint (includes `port` field)
+
+### Understanding Microcode Sequencer (MS) Behavior
+
+Complex instructions (like `idiv`) are handled by the MS, which generates multiple uops from microcode ROM. The timeline format captures the distinctive stall pattern:
+
+**Example from `idiv eax` (10 uops: 3 MITE + 7 MS):**
+
+**Iteration 0:**
+- Cycle 3: First 3 uops (MITE-decoded) get `"Q"` (added to IDQ)
+- Cycle 4: MS uops show blocking with `ms_stalled`, `pre_stall` (MS initializing)
+- Cycle 5-6: MS delivers uops in batches (`"Q"` events)
+- Cycle 7: Next instruction shows blocking with `ms_post_stall` (MS cleanup preventing decode)
+- Cycle 8: Normal decoding resumes
+
+This pattern repeats each iteration, creating a characteristic "stutter" in the front-end.
+
+## Comparison with `-json` Format
+
+| Aspect | `-json` (cycle-oriented) | `-timeline` (uop-oriented) |
+|--------|-------------------------|---------------------------|
+| Structure | Events grouped by cycle | Events grouped by uop |
+| Event lookup | "What happened in cycle X?" | "What happened to uop Y?" |
+| Blocking info | Separate `blockedFrom*` arrays per cycle | Embedded in uop's event timeline |
+| Stage codes | Event names (`addedToIDQ`, `dispatched`, etc.) | Single letters (`P`, `Q`, `I`, `D`, etc.) |
+| Use case | Analyzing cycle-by-cycle behavior | Building UI tables, tooltips, timelines |
+| File size | Larger (more repetition) | Smaller (sparse representation) |
+
+## Example Usage
+
+**Finding why a uop stalled:**
+
+```python
+import json
+
+with open('timeline.json') as f:
+    data = json.load(f)
+
+# Find uop 3 from iteration 0
+uop = next(u for u in data['uops'] if u['rnd'] == 0 and u['instrID'] == 0 and u['lamUopID'] == 3)
+
+# Check each cycle
+for cycle in sorted(uop['events'].keys(), key=int):
+    event = uop['events'][cycle]
+    if isinstance(event, dict):
+        print(f"Cycle {cycle}: BLOCKED - {event['reason']} (waiting for {data['eventCodes'][event['waitingFor']]})")
+    else:
+        print(f"Cycle {cycle}: {data['eventCodes'][event]}")
+```
+
+**Building a table:**
+
+Each uop becomes a table row. The `events` dict provides the sparse data for the timeline cells. When a cell's cycle appears in the events dict, display the event (letter code or tooltip for blocking). Otherwise, show "same state as previous event."
+
+This format makes it straightforward to build interactive visualizations without needing to understand the full complexity of Intel's pipeline architecture.

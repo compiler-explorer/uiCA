@@ -377,6 +377,7 @@ class FrontEnd:
       self.perfEvents = perfEvents
       self.trackBlocking = trackBlocking
       self.blockingInfo = [] # tracks why instructions can't be decoded each cycle
+      self.frontEndUopBlockingInfo = [] # tracks why uops can't be delivered to IDQ each cycle
 
       self.MS = MicrocodeSequencer(self.uArchConfig)
 
@@ -482,7 +483,32 @@ class FrontEnd:
          # add new uops to IDQ
          newUops = []
          if self.MS.isBusy():
+            # Check MS state before calling cycle() (which modifies state)
+            msHadQueuedUops = len(self.MS.uopQueue) > 0
+            msWasStalled = self.MS.stalled > 0
+
             newUops = self.MS.cycle()
+
+            # Track uops that couldn't be delivered from MS
+            if self.trackBlocking and not newUops and msHadQueuedUops:
+               # MS is stalled, track uops waiting in queue
+               # If MS was stalled with uops queued, it's pre-stall (initial delay)
+               # If MS wasn't stalled but still has uops, shouldn't happen
+               # After queue empties, postStall is set and we get post-stall
+               stallType = 'pre_stall' if msWasStalled else 'post_stall'
+               # Track up to 4 uops (the next batch that would be delivered)
+               for lamUop in list(self.MS.uopQueue)[:4]:
+                  self.frontEndUopBlockingInfo.append(
+                     FrontEndUopBlockingEvent(clock, lamUop, 'ms_stalled', {'stallType': stallType})
+                  )
+
+            # Track instructions that can't decode because MS is busy
+            if self.trackBlocking and not newUops and not msHadQueuedUops and self.instructionQueue:
+               # MS is in post-stall (queue empty but still busy), blocking decode of next instruction
+               for instrI in list(self.instructionQueue)[:1]:  # Just the next instruction
+                  self.blockingInfo.append(
+                     InstructionBlockingEvent(clock, instrI, 'ms_post_stall', {})
+                  )
          elif self.uopSource == 'MITE':
             self.preDecoder.cycle(clock)
             newInstrIUops = self.decoder.cycle(clock)
@@ -1380,6 +1406,7 @@ class InstrInstance:
 
 BlockingEvent = namedtuple('BlockingEvent', ['clock', 'uop', 'reason', 'details'])
 InstructionBlockingEvent = namedtuple('InstructionBlockingEvent', ['clock', 'instrInstance', 'reason', 'details'])
+FrontEndUopBlockingEvent = namedtuple('FrontEndUopBlockingEvent', ['clock', 'lamUop', 'reason', 'details'])
 
 def split64ByteBlockTo16ByteBlocks(cacheBlock):
    return [[ii for ii in cacheBlock if b*16 <= ii.address % 64 < (b+1)*16 ] for b in range(0,4)]
@@ -1874,6 +1901,188 @@ def _groupAndDeduplicateBlockingEvents(events, maxCycle, getKey):
 
    return deduplicated
 
+def _sanitizeDetailsForJSON(details):
+   """Filter out non-JSON-serializable values from blocking event details"""
+   sanitized = {}
+   for key, value in details.items():
+      # Skip Uop, LaminatedUop, FusedUop, InstrInstance objects
+      if isinstance(value, (Uop, LaminatedUop, FusedUop, InstrInstance)):
+         continue
+      # Keep only JSON-serializable types
+      if isinstance(value, (str, int, float, bool, type(None))):
+         sanitized[key] = value
+      elif isinstance(value, (list, tuple)):
+         # Recursively sanitize lists/tuples if needed, but for now just skip
+         continue
+      elif isinstance(value, dict):
+         # Recursively sanitize nested dicts if needed, but for now just skip
+         continue
+   return sanitized
+
+def generateTimelineJSON(filename, instructions, frontEnd, uArchConfig, maxCycle, scheduler, renamer, trackBlocking):
+   import json
+
+   # Event codes legend
+   eventCodes = {
+      'P': 'Predecoded',
+      'Q': 'Added to IDQ',
+      'I': 'Issued',
+      'r': 'Ready for dispatch',
+      'D': 'Dispatched',
+      'E': 'Executed',
+      'R': 'Retired'
+   }
+
+   # Parameters (same as cycle JSON)
+   parameters = {
+      'uArchName': uArchConfig.name,
+      'IQWidth': uArchConfig.IQWidth,
+      'IDQWidth': uArchConfig.IDQWidth,
+      'issueWidth': uArchConfig.issueWidth,
+      'RBWidth': uArchConfig.RBWidth,
+      'RSWidth': uArchConfig.RSWidth,
+      'allPorts': allPorts[uArchConfig.name],
+      'nDecoders': uArchConfig.nDecoders,
+      'DSBBlockSize': uArchConfig.DSBBlockSize,
+      'LSD': (frontEnd.uopSource == 'LSD'),
+      'LSDUnrollCount': frontEnd.LSDUnrollCount,
+      'mode': 'unroll' if frontEnd.unroll else 'loop',
+      'blockingTracked': trackBlocking
+   }
+
+   # Instructions list
+   instrList = []
+   instrToID = {}
+   for instr in instructions:
+      instrDict = {}
+      instrDict['asm'] = instr.asm
+      instrDict['opcode'] = instr.opcode
+      instrDict['url'] = getURL(instr.instrStr)
+      ID = len(instrToID.keys())
+      instrDict['instrID'] = ID
+      instrToID[instr] = ID
+      if instr.macroFusedWithNextInstr:
+         instrDict['macroFusedWithNextInstr'] = True
+      for instrI in frontEnd.allGeneratedInstrInstances:
+         if instrI.instr == instr:
+            instrDict['source'] = instrI.source
+            break
+      instrList.append(instrDict)
+
+   # Build uop timeline
+   uopsList = []
+
+   # Create blocking lookup tables if tracking enabled
+   if trackBlocking:
+      # Scheduler blocking (dispatch)
+      dispatchBlocking = _groupAndDeduplicateBlockingEvents(scheduler.blockingInfo, maxCycle, lambda e: e.uop)
+      # Renamer blocking (issue)
+      issueBlocking = _groupAndDeduplicateBlockingEvents(renamer.blockingInfo, maxCycle, lambda e: e.uop)
+      # Front-end uop blocking (IDQ delivery)
+      idqDeliveryBlocking = _groupAndDeduplicateBlockingEvents(frontEnd.frontEndUopBlockingInfo, maxCycle, lambda e: e.lamUop)
+      # Front-end instruction blocking (decode)
+      decodeBlocking = _groupAndDeduplicateBlockingEvents(frontEnd.blockingInfo, maxCycle, lambda e: e.instrInstance)
+
+   for instrI in frontEnd.allGeneratedInstrInstances:
+      instrID = instrToID[instrI.instr]
+      rnd = instrI.rnd
+      preDec = instrI.predecoded if not instrI.instr.macroFusedWithPrevInstr else None
+
+      # Process all uops for this instruction
+      for lamUopI, lamUop in enumerate(instrI.regMergeUops + instrI.stackSyncUops + instrI.uops):
+         for fUopI, fUop in enumerate(lamUop.getFusedUops()):
+            for uopI, uop in enumerate(fUop.getUnfusedUops()):
+               uopData = {
+                  'instrID': instrID,
+                  'rnd': rnd,
+                  'lamUopID': lamUopI,
+                  'fUopID': fUopI,
+                  'uopID': uopI,
+                  'possiblePorts': uop.prop.possiblePorts if uop.prop.possiblePorts else [],
+                  'actualPort': uop.actualPort if uop.actualPort else None,
+                  'events': {}
+               }
+
+               # Add special flags
+               if lamUop in instrI.regMergeUops:
+                  uopData['regMergeUop'] = True
+               if lamUop in instrI.stackSyncUops:
+                  uopData['stackSyncUop'] = True
+
+               # Standard pipeline events
+               if preDec is not None and preDec <= maxCycle:
+                  uopData['events'][str(preDec)] = 'P'
+               if lamUop.addedToIDQ is not None and lamUop.addedToIDQ <= maxCycle and fUopI == 0:
+                  uopData['events'][str(lamUop.addedToIDQ)] = 'Q'
+               if fUop.issued is not None and fUop.issued <= maxCycle:
+                  uopData['events'][str(fUop.issued)] = 'I'
+               if uop.readyForDispatch is not None and uop.readyForDispatch <= maxCycle:
+                  uopData['events'][str(uop.readyForDispatch)] = 'r'
+               if uop.dispatched is not None and uop.dispatched <= maxCycle:
+                  uopData['events'][str(uop.dispatched)] = 'D'
+               if uop.executed is not None and uop.executed <= maxCycle:
+                  uopData['events'][str(uop.executed)] = 'E'
+               if fUop.retired is not None and fUop.retired <= maxCycle:
+                  uopData['events'][str(fUop.retired)] = 'R'
+
+               # Add blocking events if tracking enabled
+               if trackBlocking:
+                  # Dispatch blocking
+                  if uop in dispatchBlocking:
+                     for clock, reason, details in dispatchBlocking[uop]:
+                        uopData['events'][str(clock)] = {
+                           'event': 'blocked',
+                           'stage': 'dispatch',
+                           'reason': reason,
+                           'waitingFor': 'D',
+                           **_sanitizeDetailsForJSON(details)
+                        }
+
+                  # Issue blocking
+                  if uop in issueBlocking:
+                     for clock, reason, details in issueBlocking[uop]:
+                        uopData['events'][str(clock)] = {
+                           'event': 'blocked',
+                           'stage': 'issue',
+                           'reason': reason,
+                           'waitingFor': 'I',
+                           **_sanitizeDetailsForJSON(details)
+                        }
+
+                  # IDQ delivery blocking (at lamUop level)
+                  if lamUop in idqDeliveryBlocking and fUopI == 0:
+                     for clock, reason, details in idqDeliveryBlocking[lamUop]:
+                        uopData['events'][str(clock)] = {
+                           'event': 'blocked',
+                           'stage': 'idq_delivery',
+                           'reason': reason,
+                           'waitingFor': 'Q',
+                           **_sanitizeDetailsForJSON(details)
+                        }
+
+                  # Decode blocking (at instruction level)
+                  if instrI in decodeBlocking and lamUopI == 0 and fUopI == 0 and uopI == 0:
+                     for clock, reason, details in decodeBlocking[instrI]:
+                        uopData['events'][str(clock)] = {
+                           'event': 'blocked',
+                           'stage': 'decode',
+                           'reason': reason,
+                           'waitingFor': 'P',
+                           **_sanitizeDetailsForJSON(details)
+                        }
+
+               uopsList.append(uopData)
+
+   output = {
+      'eventCodes': eventCodes,
+      'parameters': parameters,
+      'instructions': instrList,
+      'uops': uopsList
+   }
+
+   with open(filename, 'w') as f:
+      f.write(json.dumps(output, sort_keys=True))
+
 def generateJSONOutput(filename, instructions, frontEnd, uArchConfig, maxCycle, scheduler, renamer, trackBlocking):
    import json
    parameters = {
@@ -1967,41 +2176,6 @@ def generateJSONOutput(filename, instructions, frontEnd, uArchConfig, maxCycle, 
                if (uop.executed is not None) and (uop.executed <= maxCycle):
                   cycles[uop.executed].setdefault('executed', []).append(unfusedUopDict)
 
-   # Process scheduler blocking events
-   for uop, events in _groupAndDeduplicateBlockingEvents(scheduler.blockingInfo, maxCycle, lambda e: e.uop).items():
-      if uop not in unfusedUopToDict:
-         continue
-      for clock, reason, details in events:
-         blockingDict = unfusedUopToDict[uop].copy()
-         blockingDict['reason'] = reason
-         for key, value in details.items():
-            if key == 'dispatchedInstead' and value in unfusedUopToDict:
-               blockingDict['dispatchedInstead'] = unfusedUopToDict[value]
-            else:
-               blockingDict[key] = value
-         cycles[clock].setdefault('blockedFromDispatch', []).append(blockingDict)
-
-   # Process renamer blocking events
-   for uop, events in _groupAndDeduplicateBlockingEvents(renamer.blockingInfo, maxCycle, lambda e: e.uop).items():
-      if uop not in unfusedUopToDict:
-         continue
-      for clock, reason, details in events:
-         blockingDict = unfusedUopToDict[uop].copy()
-         blockingDict['reason'] = reason
-         for key, value in details.items():
-            blockingDict[key] = value
-         cycles[clock].setdefault('blockedFromIssue', []).append(blockingDict)
-
-   # Process front-end blocking events
-   for instrI, events in _groupAndDeduplicateBlockingEvents(frontEnd.blockingInfo, maxCycle, lambda e: e.instrInstance).items():
-      instrID = instrToID[instrI.instr]
-      rnd = instrI.rnd
-      for clock, reason, details in events:
-         blockingDict = {'instrID': instrID, 'rnd': rnd, 'reason': reason}
-         for key, value in details.items():
-            blockingDict[key] = value
-         cycles[clock].setdefault('blockedFromDecode', []).append(blockingDict)
-
    jsonStr = json.dumps({'parameters': parameters, 'instructions': instrList, 'cycles': cycles}, sort_keys=True)
 
    with open(filename, 'w') as f:
@@ -2017,7 +2191,7 @@ def getURL(instrStr):
 
 # Returns the throughput
 def runSimulation(disas, uArchConfig: MicroArchConfig, alignmentOffset, initPolicy, noMicroFusion, noMacroFusion, simpleFrontEnd, minIterations, minCycles,
-                  printDetails=False, traceFile=None, graphFile=None, depGraphFile=None, jsonFile=None, trackBlocking=False):
+                  printDetails=False, traceFile=None, graphFile=None, depGraphFile=None, jsonFile=None, timelineFile=None, trackBlocking=False):
    instructions = getInstructions(disas, uArchConfig, importlib.import_module('instrData.'+uArchConfig.name+'_data'),
                                   alignmentOffset, noMicroFusion, noMacroFusion)
    if not instructions:
@@ -2120,6 +2294,9 @@ def runSimulation(disas, uArchConfig: MicroArchConfig, alignmentOffset, initPoli
    if jsonFile is not None:
       generateJSONOutput(jsonFile, instructions, frontEnd, uArchConfig, clock-1, scheduler, frontEnd.renamer, trackBlocking)
 
+   if timelineFile is not None:
+      generateTimelineJSON(timelineFile, instructions, frontEnd, uArchConfig, clock-1, scheduler, frontEnd.renamer, trackBlocking)
+
    return TP
 
 
@@ -2143,6 +2320,7 @@ def main():
    parser.add_argument('-minIterations', help='Simulate at least this many iterations; default: 10', type=int, default=10)
    parser.add_argument('-minCycles', help='Simulate at least this many cycles; default: 500', type=int, default=500)
    parser.add_argument('-json', help='JSON output', nargs='?', const='result.json')
+   parser.add_argument('-timeline', help='Timeline JSON output', nargs='?', const='timeline.json')
    parser.add_argument('-depGraph', help='Output the dependency graph; the format is determined by the filename extension', nargs='?', const='dep.svg')
    parser.add_argument('-trackBlocking', help='Track blocking events (may impact performance)', action='store_true')
    parser.add_argument('-initPolicy', help='Initial register state; '
@@ -2160,7 +2338,7 @@ def main():
       exit(1)
 
    if args.arch == 'all':
-      if args.TPonly or args.trace or args.graph or args.depGraph or args.json or (args.alignmentOffset == 'all'):
+      if args.TPonly or args.trace or args.graph or args.depGraph or args.json or args.timeline or (args.alignmentOffset == 'all'):
          print('Unsupported parameter combination')
          exit(1)
       disasList = [xed.disasFile(args.filename, chip=MicroArchConfigs[uArch].XEDName, raw=args.raw, useIACAMarkers=args.iacaMarkers) for uArch in allMicroArchs]
@@ -2184,7 +2362,7 @@ def main():
    uArchConfig = MicroArchConfigs[args.arch]
    disas = xed.disasFile(args.filename, chip=uArchConfig.XEDName, raw=args.raw, useIACAMarkers=args.iacaMarkers)
    if args.alignmentOffset == 'all':
-      if args.TPonly or args.trace or args.graph or args.depGraph or args.json:
+      if args.TPonly or args.trace or args.graph or args.depGraph or args.json or args.timeline:
          print('Unsupported parameter combination')
          exit(1)
       with futures.ProcessPoolExecutor() as executor:
@@ -2203,7 +2381,7 @@ def main():
          print('    - {:.2f} otherwise\n'.format(sortedTP[-1][0], sortedTP[-1][1]))
    else:
       TP = runSimulation(disas, uArchConfig, int(args.alignmentOffset), args.initPolicy, args.noMicroFusion, args.noMacroFusion, args.simpleFrontEnd,
-                         args.minIterations, args.minCycles, not args.TPonly, args.trace, args.graph, args.depGraph, args.json, args.trackBlocking)
+                         args.minIterations, args.minCycles, not args.TPonly, args.trace, args.graph, args.depGraph, args.json, args.timeline, args.trackBlocking)
       if args.TPonly:
          print('{:.2f}'.format(TP))
 
