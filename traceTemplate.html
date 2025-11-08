@@ -97,6 +97,80 @@ code {
     z-index: 1000;
     margin-bottom: -1px;
 }
+
+.move-eliminated-cell {
+    border: 2px solid #4CAF50 !important;
+    cursor: help;
+    position: relative;
+}
+
+.move-eliminated-cell[data-tooltip]:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background-color: #2d5f2f;
+    color: #fff;
+    padding: 8px 12px;
+    border-radius: 4px;
+    white-space: pre-line;
+    font-size: 13px;
+    z-index: 1000;
+    min-width: 200px;
+    text-align: left;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    margin-bottom: 5px;
+}
+
+.move-eliminated-cell[data-tooltip]:hover::before {
+    content: '';
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: #2d5f2f;
+    z-index: 1000;
+    margin-bottom: -1px;
+}
+
+.move-not-eliminated-cell {
+    border: 2px dashed #FF9800 !important;
+    cursor: help;
+    position: relative;
+}
+
+.move-not-eliminated-cell[data-tooltip]:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background-color: #8B5A00;
+    color: #fff;
+    padding: 8px 12px;
+    border-radius: 4px;
+    white-space: pre-line;
+    font-size: 13px;
+    z-index: 1000;
+    min-width: 200px;
+    text-align: left;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+    margin-bottom: 5px;
+}
+
+.move-not-eliminated-cell[data-tooltip]:hover::before {
+    content: '';
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 6px solid transparent;
+    border-top-color: #8B5A00;
+    z-index: 1000;
+    margin-bottom: -1px;
+}
 </style>
 
 <script>
@@ -134,7 +208,12 @@ function formatBlockingReason(reason, stallType) {
         'issue_width_exceeded': 'Issue width limit reached',
         'reorder_buffer_full': 'Reorder buffer full',
         'reservation_station_full': 'Reservation station full',
-        'idq_full': 'IDQ full'
+        'idq_full': 'IDQ full',
+        'eliminated': 'Move eliminated via register aliasing',
+        'aliasing_slots_exhausted': 'Register aliasing tracking slots full',
+        'pipeline_busy_prev_eliminations': 'Move elimination pipeline busy',
+        'cycle_slot_limit_reached': 'Cycle elimination limit reached',
+        'multiple_constraints': 'Multiple elimination constraints exceeded'
     }
     return reasonMap[reason] || reason.replace(/_/g, ' ')
 }
@@ -144,6 +223,26 @@ function formatTooltip(blocking) {
     lines.push('Blocked at ' + blocking.stage)
     lines.push('Reason: ' + formatBlockingReason(blocking.reason, blocking.stallType))
     lines.push('Waiting for: ' + eventNames[blocking.waitingFor])
+    return lines.join('\n')
+}
+
+function formatMoveEliminationTooltip(moveElim) {
+    var lines = []
+    if (moveElim.eliminated) {
+        lines.push('Move eliminated via register aliasing')
+        lines.push(moveElim.regType + ' register renamed without allocation')
+    } else {
+        lines.push('Move elimination failed')
+        lines.push('Reason: ' + formatBlockingReason(moveElim.reason))
+        lines.push('Slots: ' + moveElim.used + '/' + moveElim.totalSlots + ' used')
+        if (moveElim.pipeline > 0) {
+            lines.push('Pipeline penalty: ' + moveElim.pipeline)
+        }
+        if (moveElim.aliasing > 0) {
+            lines.push('Aliasing slots: ' + moveElim.aliasing)
+        }
+        lines.push('Available: ' + moveElim.available)
+    }
     return lines.join('\n')
 }
 
@@ -216,6 +315,20 @@ function createTable() {
                         if (uop.blocking && uop.blocking[cycle]) {
                             cellClass = ' class="blocked-cell"'
                             tooltip = ' data-tooltip="' + formatTooltip(uop.blocking[cycle]) + '"'
+                        }
+
+                        // Check for move elimination information
+                        if (uop.moveElimination) {
+                            // For successful elimination, annotate the 'E' event
+                            if (uop.moveElimination.eliminated && event === 'E') {
+                                cellClass = ' class="move-eliminated-cell"'
+                                tooltip = ' data-tooltip="' + formatMoveEliminationTooltip(uop.moveElimination) + '"'
+                            }
+                            // For failed elimination, annotate the 'I' event
+                            else if (!uop.moveElimination.eliminated && event === 'I') {
+                                cellClass = ' class="move-not-eliminated-cell"'
+                                tooltip = ' data-tooltip="' + formatMoveEliminationTooltip(uop.moveElimination) + '"'
+                            }
                         }
 
                         tableHtml += '<td' + cellClass + tooltip + ' style="background-color:' + eventToColor[event] + '">' + event + '</td>'

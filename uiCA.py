@@ -163,6 +163,8 @@ class Renamer:
       self.multiUseSIMDDict = {}
       self.multiUseSIMDDictUseInCycle = {}
 
+      self.moveEliminationInfo = []
+
       self.renamerActiveCycle = 0
 
       self.curStoreBufferEntry = None
@@ -233,6 +235,50 @@ class Renamer:
                   if nGPRMoveElimPossible > 0:
                      uop.eliminated = True
                      nGPRMoveElim += 1
+
+                  # Track move elimination event
+                  if self.uArchConfig.moveEliminationGPRSlots != 'unlimited':
+                     totalSlots = self.uArchConfig.moveEliminationGPRSlots
+                     prevCyclesPenalty = sum(self.nGPRMoveElimInCycle.get(self.renamerActiveCycle - i, 0) for i in range(1, self.uArchConfig.moveEliminationPipelineLength))
+                     aliasingSlotsPenalty = self.multiUseGPRDictUseInCycle.get(self.renamerActiveCycle - self.uArchConfig.moveEliminationPipelineLength, 0)
+
+                     if uop.eliminated:
+                        used = nGPRMoveElim
+                        reason = 'eliminated'
+                     else:
+                        used = nGPRMoveElim
+                        # Determine reason for failure
+                        constraints = []
+                        if used >= totalSlots:
+                           constraints.append('cycle_slot_limit_reached')
+                        if prevCyclesPenalty > 0:
+                           constraints.append('pipeline_busy_prev_eliminations')
+                        if aliasingSlotsPenalty > 0:
+                           constraints.append('aliasing_slots_exhausted')
+
+                        if len(constraints) > 1:
+                           reason = 'multiple_constraints'
+                        elif len(constraints) == 1:
+                           reason = constraints[0]
+                        else:
+                           reason = 'unknown'
+
+                     details = {
+                        'totalSlots': totalSlots,
+                        'used': used,
+                        'pipeline': prevCyclesPenalty,
+                        'aliasing': aliasingSlotsPenalty,
+                        'available': nGPRMoveElimPossible
+                     }
+
+                     self.moveEliminationInfo.append(MoveEliminationEvent(
+                        clock=self.renamerActiveCycle,
+                        uop=uop,
+                        eliminated=uop.eliminated,
+                        regType='GPR',
+                        reason=reason,
+                        details=details
+                     ))
                elif ('MM' in canonicalInpReg):
                   if self.uArchConfig.moveEliminationSIMDSlots == 'unlimited':
                      nSIMDMoveElimPossible = 1
@@ -243,6 +289,50 @@ class Renamer:
                   if nSIMDMoveElimPossible > 0:
                      uop.eliminated = True
                      nSIMDMoveElim += 1
+
+                  # Track move elimination event
+                  if self.uArchConfig.moveEliminationSIMDSlots != 'unlimited':
+                     totalSlots = self.uArchConfig.moveEliminationSIMDSlots
+                     prevCyclesPenalty = sum(self.nSIMDMoveElimInCycle.get(self.renamerActiveCycle - i, 0) for i in range(1, self.uArchConfig.moveEliminationPipelineLength))
+                     aliasingSlotsPenalty = self.multiUseSIMDDictUseInCycle.get(self.renamerActiveCycle - self.uArchConfig.moveEliminationPipelineLength, 0)
+
+                     if uop.eliminated:
+                        used = nSIMDMoveElim
+                        reason = 'eliminated'
+                     else:
+                        used = nSIMDMoveElim
+                        # Determine reason for failure
+                        constraints = []
+                        if used >= totalSlots:
+                           constraints.append('cycle_slot_limit_reached')
+                        if prevCyclesPenalty > 0:
+                           constraints.append('pipeline_busy_prev_eliminations')
+                        if aliasingSlotsPenalty > 0:
+                           constraints.append('aliasing_slots_exhausted')
+
+                        if len(constraints) > 1:
+                           reason = 'multiple_constraints'
+                        elif len(constraints) == 1:
+                           reason = constraints[0]
+                        else:
+                           reason = 'unknown'
+
+                     details = {
+                        'totalSlots': totalSlots,
+                        'used': used,
+                        'pipeline': prevCyclesPenalty,
+                        'aliasing': aliasingSlotsPenalty,
+                        'available': nSIMDMoveElimPossible
+                     }
+
+                     self.moveEliminationInfo.append(MoveEliminationEvent(
+                        clock=self.renamerActiveCycle,
+                        uop=uop,
+                        eliminated=uop.eliminated,
+                        regType='SIMD',
+                        reason=reason,
+                        details=details
+                     ))
 
       if (nGPRMoveElim == 0) and (not self.uArchConfig.moveEliminationGPRAllAliasesMustBeOverwritten):
          for k, v in list(self.multiUseGPRDict.items()):
@@ -1407,6 +1497,7 @@ class InstrInstance:
 BlockingEvent = namedtuple('BlockingEvent', ['clock', 'uop', 'reason', 'details'])
 InstructionBlockingEvent = namedtuple('InstructionBlockingEvent', ['clock', 'instrInstance', 'reason', 'details'])
 FrontEndUopBlockingEvent = namedtuple('FrontEndUopBlockingEvent', ['clock', 'lamUop', 'reason', 'details'])
+MoveEliminationEvent = namedtuple('MoveEliminationEvent', ['clock', 'uop', 'eliminated', 'regType', 'reason', 'details'])
 
 def split64ByteBlockTo16ByteBlocks(cacheBlock):
    return [[ii for ii in cacheBlock if b*16 <= ii.address % 64 < (b+1)*16 ] for b in range(0,4)]
@@ -1740,6 +1831,12 @@ def generateHTMLTraceTable(filename, instructions, instrInstances, lastRelevantR
       idqDeliveryBlocking = _groupAndDeduplicateBlockingEvents(frontEnd.frontEndUopBlockingInfo, maxCycle, lambda e: e.lamUop)
       decodeBlocking = _groupAndDeduplicateBlockingEvents(frontEnd.blockingInfo, maxCycle, lambda e: e.instrInstance)
 
+      # Move elimination events (one per uop)
+      moveElimination = {}
+      for event in renamer.moveEliminationInfo:
+         if event.clock <= maxCycle:
+            moveElimination[event.uop] = event
+
    tableDataForRnd = []
    prevRnd = -1
    prevInstrI = None
@@ -1837,6 +1934,16 @@ def generateHTMLTraceTable(filename, instructions, instrInstances, lastRelevantR
                            'reason': reason,
                            'waitingFor': 'P'
                         }
+
+                  # Add move elimination info if event exists
+                  if uop in moveElimination:
+                     event = moveElimination[uop]
+                     uopData['moveElimination'] = {
+                        'eliminated': event.eliminated,
+                        'regType': event.regType,
+                        'reason': event.reason,
+                        **event.details
+                     }
 
       prevInstrI = instrI
 
@@ -2041,6 +2148,12 @@ def generateTimelineJSON(filename, instructions, frontEnd, uArchConfig, maxCycle
       # Front-end instruction blocking (decode)
       decodeBlocking = _groupAndDeduplicateBlockingEvents(frontEnd.blockingInfo, maxCycle, lambda e: e.instrInstance)
 
+      # Move elimination events (one per uop)
+      moveElimination = {}
+      for event in renamer.moveEliminationInfo:
+         if event.clock <= maxCycle:
+            moveElimination[event.uop] = event
+
    for instrI in frontEnd.allGeneratedInstrInstances:
       instrID = instrToID[instrI.instr]
       rnd = instrI.rnd
@@ -2136,6 +2249,16 @@ def generateTimelineJSON(filename, instructions, frontEnd, uArchConfig, maxCycle
                               'waitingFor': 'P',
                               **_sanitizeDetailsForJSON(details)
                            }
+
+                  # Add move elimination info if tracking enabled and event exists
+                  if uop in moveElimination:
+                     event = moveElimination[uop]
+                     uopData['moveElimination'] = {
+                        'eliminated': event.eliminated,
+                        'regType': event.regType,
+                        'reason': event.reason,
+                        **event.details
+                     }
 
                uopsList.append(uopData)
 
