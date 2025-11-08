@@ -171,7 +171,7 @@ class Renamer:
       self.lastRegMergeIssued = None # last uop for which register merge uops were issued
       self.blockingInfo = [] # tracks why uops in IDQ don't issue each cycle
 
-   def cycle(self):
+   def cycle(self, clock):
       self.renamerActiveCycle += 1
 
       renamerUops = []
@@ -193,24 +193,24 @@ class Renamer:
                if self.trackBlocking:
                   for lamUop in self.IDQ:
                      for uop in lamUop.getUnfusedUops():
-                        self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'register_merge_required', {}))
+                        self.blockingInfo.append(BlockingEvent(clock, uop, 'register_merge_required', {}))
                break
 
          if firstUnfusedUop.prop.isFirstUopOfInstr and firstUnfusedUop.prop.instr.isSerializingInstr and not self.reorderBuffer.isEmpty():
             # Record that this serializing instruction is blocked
             if self.trackBlocking:
                for uop in lamUop.getUnfusedUops():
-                  self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'serializing_instruction_waiting', {}))
+                  self.blockingInfo.append(BlockingEvent(clock, uop, 'serializing_instruction_waiting', {}))
             break
          fusedUops = lamUop.getFusedUops()
          if len(renamerUops) + len(fusedUops) > self.uArchConfig.issueWidth:
             # Record that this lamUop and all remaining IDQ uops blocked by issue width
             if self.trackBlocking:
                for uop in lamUop.getUnfusedUops():
-                  self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded', {}))
+                  self.blockingInfo.append(BlockingEvent(clock, uop, 'issue_width_exceeded', {}))
                for remainingLamUop in list(self.IDQ)[1:]:  # Skip first (already handled)
                   for uop in remainingLamUop.getUnfusedUops():
-                     self.blockingInfo.append(BlockingEvent(self.renamerActiveCycle, uop, 'issue_width_exceeded', {}))
+                     self.blockingInfo.append(BlockingEvent(clock, uop, 'issue_width_exceeded', {}))
             break
          renamerUops.extend(fusedUops)
          self.IDQ.popleft()
@@ -428,7 +428,7 @@ class FrontEnd:
    def cycle(self, clock):
       issueUops = []
       if not self.reorderBuffer.isFull() and not self.scheduler.isFull(): # len(self.IDQ) >= uArchConfig.issueWidth and the first check seems to be wrong, but leads to better results
-         issueUops = self.renamer.cycle()
+         issueUops = self.renamer.cycle(clock)
       else:
          # Record all uops in IDQ as blocked by RB or RS full
          if self.trackBlocking:
@@ -2088,46 +2088,54 @@ def generateTimelineJSON(filename, instructions, frontEnd, uArchConfig, maxCycle
                   # Dispatch blocking
                   if uop in dispatchBlocking:
                      for clock, reason, details in dispatchBlocking[uop]:
-                        uopData['events'][str(clock)] = {
-                           'event': 'blocked',
-                           'stage': 'dispatch',
-                           'reason': reason,
-                           'waitingFor': 'D',
-                           **_sanitizeDetailsForJSON(details)
-                        }
+                        # Don't overwrite pipeline events (P/Q/I/r/D/E/R)
+                        if str(clock) not in uopData['events']:
+                           uopData['events'][str(clock)] = {
+                              'event': 'blocked',
+                              'stage': 'dispatch',
+                              'reason': reason,
+                              'waitingFor': 'D',
+                              **_sanitizeDetailsForJSON(details)
+                           }
 
                   # Issue blocking
                   if uop in issueBlocking:
                      for clock, reason, details in issueBlocking[uop]:
-                        uopData['events'][str(clock)] = {
-                           'event': 'blocked',
-                           'stage': 'issue',
-                           'reason': reason,
-                           'waitingFor': 'I',
-                           **_sanitizeDetailsForJSON(details)
-                        }
+                        # Don't overwrite pipeline events (P/Q/I/r/D/E/R)
+                        if str(clock) not in uopData['events']:
+                           uopData['events'][str(clock)] = {
+                              'event': 'blocked',
+                              'stage': 'issue',
+                              'reason': reason,
+                              'waitingFor': 'I',
+                              **_sanitizeDetailsForJSON(details)
+                           }
 
                   # IDQ delivery blocking (at lamUop level)
                   if lamUop in idqDeliveryBlocking and fUopI == 0:
                      for clock, reason, details in idqDeliveryBlocking[lamUop]:
-                        uopData['events'][str(clock)] = {
-                           'event': 'blocked',
-                           'stage': 'idq_delivery',
-                           'reason': reason,
-                           'waitingFor': 'Q',
-                           **_sanitizeDetailsForJSON(details)
-                        }
+                        # Don't overwrite pipeline events (P/Q/I/r/D/E/R)
+                        if str(clock) not in uopData['events']:
+                           uopData['events'][str(clock)] = {
+                              'event': 'blocked',
+                              'stage': 'idq_delivery',
+                              'reason': reason,
+                              'waitingFor': 'Q',
+                              **_sanitizeDetailsForJSON(details)
+                           }
 
                   # Decode blocking (at instruction level)
                   if instrI in decodeBlocking and lamUopI == 0 and fUopI == 0 and uopI == 0:
                      for clock, reason, details in decodeBlocking[instrI]:
-                        uopData['events'][str(clock)] = {
-                           'event': 'blocked',
-                           'stage': 'decode',
-                           'reason': reason,
-                           'waitingFor': 'P',
-                           **_sanitizeDetailsForJSON(details)
-                        }
+                        # Don't overwrite pipeline events (P/Q/I/r/D/E/R)
+                        if str(clock) not in uopData['events']:
+                           uopData['events'][str(clock)] = {
+                              'event': 'blocked',
+                              'stage': 'decode',
+                              'reason': reason,
+                              'waitingFor': 'P',
+                              **_sanitizeDetailsForJSON(details)
+                           }
 
                uopsList.append(uopData)
 
