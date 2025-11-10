@@ -61,13 +61,13 @@ code {
     background-color: white;
 }
 
-.blocked-cell {
-    border: 2px dotted #ff6b6b !important;
+/* Base tooltip mechanics - applies to any td with data-tooltip */
+td[data-tooltip] {
     cursor: help;
     position: relative;
 }
 
-.blocked-cell[data-tooltip]:hover::after {
+td[data-tooltip]:hover::after {
     content: attr(data-tooltip);
     position: absolute;
     bottom: 100%;
@@ -86,7 +86,7 @@ code {
     margin-bottom: 5px;
 }
 
-.blocked-cell[data-tooltip]:hover::before {
+td[data-tooltip]:hover::before {
     content: '';
     position: absolute;
     bottom: 100%;
@@ -98,78 +98,41 @@ code {
     margin-bottom: -1px;
 }
 
+/* Visual indicators and tooltip color overrides */
+.blocked-cell {
+    border: 2px dotted #ff6b6b !important;
+}
+
+.blocked-cell[data-tooltip]:hover::after {
+    background-color: #8B0000;
+}
+
+.blocked-cell[data-tooltip]:hover::before {
+    border-top-color: #8B0000;
+}
+
 .move-eliminated-cell {
     border: 2px solid #4CAF50 !important;
-    cursor: help;
-    position: relative;
 }
 
 .move-eliminated-cell[data-tooltip]:hover::after {
-    content: attr(data-tooltip);
-    position: absolute;
-    bottom: 100%;
-    left: 50%;
-    transform: translateX(-50%);
     background-color: #2d5f2f;
-    color: #fff;
-    padding: 8px 12px;
-    border-radius: 4px;
-    white-space: pre-line;
-    font-size: 13px;
-    z-index: 1000;
-    min-width: 200px;
-    text-align: left;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-    margin-bottom: 5px;
 }
 
 .move-eliminated-cell[data-tooltip]:hover::before {
-    content: '';
-    position: absolute;
-    bottom: 100%;
-    left: 50%;
-    transform: translateX(-50%);
-    border: 6px solid transparent;
     border-top-color: #2d5f2f;
-    z-index: 1000;
-    margin-bottom: -1px;
 }
 
 .move-not-eliminated-cell {
     border: 2px dashed #FF9800 !important;
-    cursor: help;
-    position: relative;
 }
 
 .move-not-eliminated-cell[data-tooltip]:hover::after {
-    content: attr(data-tooltip);
-    position: absolute;
-    bottom: 100%;
-    left: 50%;
-    transform: translateX(-50%);
     background-color: #8B5A00;
-    color: #fff;
-    padding: 8px 12px;
-    border-radius: 4px;
-    white-space: pre-line;
-    font-size: 13px;
-    z-index: 1000;
-    min-width: 200px;
-    text-align: left;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.3);
-    margin-bottom: 5px;
 }
 
 .move-not-eliminated-cell[data-tooltip]:hover::before {
-    content: '';
-    position: absolute;
-    bottom: 100%;
-    left: 50%;
-    transform: translateX(-50%);
-    border: 6px solid transparent;
     border-top-color: #8B5A00;
-    z-index: 1000;
-    margin-bottom: -1px;
 }
 </style>
 
@@ -246,6 +209,22 @@ function formatMoveEliminationTooltip(moveElim) {
     return lines.join('\n')
 }
 
+function formatSourceTooltip(source) {
+    var sourceNames = {
+        'MITE': 'Decoded from MITE (legacy decode pipeline)',
+        'DSB': 'Delivered from DSB (decoded uop cache)',
+        'MS': 'Delivered from MS (microcode sequencer)',
+        'LSD': 'Delivered from LSD (loop stream detector)',
+        'SE': 'Stack sync uop (stack engine)'
+    }
+    var lines = []
+    lines.push('Source: ' + source)
+    if (sourceNames[source]) {
+        lines.push(sourceNames[source])
+    }
+    return lines.join('\n')
+}
+
 function createTable() {
     var slider = document.getElementById('slider')
     var firstIt = Number(slider.noUiSlider.get()[0])
@@ -309,12 +288,12 @@ function createTable() {
                         var cycle = events[j][0]
                         var event = events[j][1]
                         var cellClass = ''
-                        var tooltip = ''
+                        var tooltipText = ''
 
                         // Check for blocking information at this cycle
                         if (uop.blocking && uop.blocking[cycle]) {
                             cellClass = ' class="blocked-cell"'
-                            tooltip = ' data-tooltip="' + formatTooltip(uop.blocking[cycle]) + '"'
+                            tooltipText = formatTooltip(uop.blocking[cycle])
                         }
 
                         // Check for move elimination information
@@ -322,14 +301,25 @@ function createTable() {
                             // For successful elimination, annotate the 'E' event
                             if (uop.moveElimination.eliminated && event === 'E') {
                                 cellClass = ' class="move-eliminated-cell"'
-                                tooltip = ' data-tooltip="' + formatMoveEliminationTooltip(uop.moveElimination) + '"'
+                                tooltipText = formatMoveEliminationTooltip(uop.moveElimination)
                             }
                             // For failed elimination, annotate the 'I' event
                             else if (!uop.moveElimination.eliminated && event === 'I') {
                                 cellClass = ' class="move-not-eliminated-cell"'
-                                tooltip = ' data-tooltip="' + formatMoveEliminationTooltip(uop.moveElimination) + '"'
+                                tooltipText = formatMoveEliminationTooltip(uop.moveElimination)
                             }
                         }
+
+                        // Append source information if available
+                        if (uop.uopSource) {
+                            if (tooltipText) {
+                                tooltipText += '\n\n' + formatSourceTooltip(uop.uopSource)
+                            } else {
+                                tooltipText = formatSourceTooltip(uop.uopSource)
+                            }
+                        }
+
+                        var tooltip = tooltipText ? ' data-tooltip="' + tooltipText + '"' : ''
 
                         tableHtml += '<td' + cellClass + tooltip + ' style="background-color:' + eventToColor[event] + '">' + event + '</td>'
 
@@ -356,7 +346,11 @@ function createTable() {
                                     if (uop.blocking && uop.blocking[c]) {
                                         // This cycle has blocking, create individual cell
                                         var gapCellClass = ' class="blocked-cell"'
-                                        var gapTooltip = ' data-tooltip="' + formatTooltip(uop.blocking[c]) + '"'
+                                        var gapTooltipText = formatTooltip(uop.blocking[c])
+                                        if (uop.uopSource) {
+                                            gapTooltipText += '\n\n' + formatSourceTooltip(uop.uopSource)
+                                        }
+                                        var gapTooltip = ' data-tooltip="' + gapTooltipText + '"'
                                         bg = `background-image: linear-gradient(to right, ${eventToColor[events[j][1]]} , ${eventToColor[events[j+1][1]]})`
                                         tableHtml += '<td' + gapCellClass + gapTooltip + ' style="' + bg + '"></td>'
                                         c++;

@@ -1882,6 +1882,7 @@ def generateHTMLTraceTable(filename, instructions, instrInstances, lastRelevantR
                uopData['possiblePorts'] = ('{' + ','.join(uop.prop.possiblePorts) + '}') if uop.prop.possiblePorts else '-'
                uopData['actualPort'] = uop.actualPort if uop.actualPort else '-'
                uopData['events'] = {}
+               uopData['uopSource'] = uop.fusedUop.laminatedUop.uopSource if uop.fusedUop.laminatedUop.uopSource else None
 
                for evCycle, ev in [(preDec, 'P'), (uop.fusedUop.laminatedUop.addedToIDQ, 'Q'), (uop.fusedUop.issued, 'I'), (uop.readyForDispatch, 'r'),
                                    (uop.dispatched, 'D'), (uop.executed, 'E'), (uop.fusedUop.retired, 'R'),
