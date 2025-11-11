@@ -310,8 +310,8 @@ function createTable() {
                             }
                         }
 
-                        // Append source information if available
-                        if (uop.uopSource) {
+                        // Append source information on first event only
+                        if (j === 0 && uop.uopSource) {
                             if (tooltipText) {
                                 tooltipText += '\n\n' + formatSourceTooltip(uop.uopSource)
                             } else {
@@ -347,9 +347,6 @@ function createTable() {
                                         // This cycle has blocking, create individual cell
                                         var gapCellClass = ' class="blocked-cell"'
                                         var gapTooltipText = formatTooltip(uop.blocking[c])
-                                        if (uop.uopSource) {
-                                            gapTooltipText += '\n\n' + formatSourceTooltip(uop.uopSource)
-                                        }
                                         var gapTooltip = ' data-tooltip="' + gapTooltipText + '"'
                                         bg = `background-image: linear-gradient(to right, ${eventToColor[events[j][1]]} , ${eventToColor[events[j+1][1]]})`
                                         tableHtml += '<td' + gapCellClass + gapTooltip + ' style="' + bg + '"></td>'
