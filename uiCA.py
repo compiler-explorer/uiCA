@@ -142,18 +142,23 @@ class RenamedOperand:
 
 RenameDictEntry = namedtuple('RenameDictEntry', ['renamedOp', 'renamedByElim32BitMove'])
 class Renamer:
-   def __init__(self, IDQ, reorderBuffer, uArchConfig: MicroArchConfig, initPolicy, trackBlocking=False):
+   def __init__(self, IDQ, reorderBuffer, uArchConfig: MicroArchConfig, initPolicy, trackBlocking=False, noRenaming=False):
       self.IDQ = IDQ
       self.reorderBuffer = reorderBuffer
       self.uArchConfig = uArchConfig
       self.absValGen = AbstractValueGenerator(initPolicy)
       self.trackBlocking = trackBlocking
+      self.noRenaming = noRenaming
 
       self.renameDict = {}
 
       # renamed operands written by current instr.
       self.curInstrRndRenameDict = {}
       self.curInstrPseudoOpDict = {}
+
+      # For tracking WAR/WAW dependencies when noRenaming is True
+      # Maps register -> list of uops that have read from it since last write
+      self.pendingReaders = {} if noRenaming else None
 
       self.nGPRMoveElimInCycle = {}
       self.multiUseGPRDict = {}
@@ -390,14 +395,38 @@ class Renamer:
                      else:
                         key = self.getRenameDictKey(inpOp)
                         renOp = self.renameDict.setdefault(key, RenameDictEntry(RenamedOperand(ready=-1), False)).renamedOp
+                        # Track readers for WAR dependencies when noRenaming is enabled
+                        if self.noRenaming and key is not None:
+                           if key not in self.pendingReaders:
+                              self.pendingReaders[key] = []
+                           self.pendingReaders[key].append(renOp)
                      uop.renamedInputOperands.append(renOp)
                   for outOp in uop.prop.outputOperands:
+                     key = self.getRenameDictKey(outOp) if not isinstance(outOp, PseudoOperand) else None
+
+                     # Create WAR/WAW dependencies when noRenaming is enabled
+                     if self.noRenaming and key is not None:
+                        # WAW: depend on previous writer
+                        if key in self.renameDict:
+                           prevWriter = self.renameDict[key].renamedOp
+                           if prevWriter.uop is not None:
+                              # Add dependency on previous writer's output
+                              uop.renamedInputOperands.append(prevWriter)
+
+                        # WAR: depend on all pending readers
+                        if key in self.pendingReaders:
+                           for readerRenOp in self.pendingReaders[key]:
+                              if readerRenOp.uop is not None and readerRenOp.uop != uop:
+                                 # Add dependency on reader's output (the value they read becomes ready after they execute)
+                                 uop.renamedInputOperands.append(readerRenOp)
+                           # Clear pending readers after write
+                           self.pendingReaders[key] = []
+
                      renOp = RenamedOperand(outOp, uop)
                      uop.renamedOutputOperands.append(renOp)
                      if isinstance(outOp, PseudoOperand):
                         self.curInstrPseudoOpDict[outOp] = renOp
                      else:
-                        key = self.getRenameDictKey(outOp)
                         self.curInstrRndRenameDict[key] = RenameDictEntry(renOp, False)
                         if isinstance(outOp, RegOperand):
                            self.absValGen.setAbstractValueForCurInstr(key, uop.prop.instr)
@@ -456,9 +485,9 @@ class Renamer:
 
 class FrontEnd:
    def __init__(self, instructions: List[Instr], reorderBuffer, scheduler, uArchConfig: MicroArchConfig,
-                unroll, alignmentOffset, initPolicy, perfEvents, simpleFrontEnd=False, trackBlocking=False):
+                unroll, alignmentOffset, initPolicy, perfEvents, simpleFrontEnd=False, trackBlocking=False, noRenaming=False):
       self.IDQ = deque()
-      self.renamer = Renamer(self.IDQ, reorderBuffer, uArchConfig, initPolicy, trackBlocking)
+      self.renamer = Renamer(self.IDQ, reorderBuffer, uArchConfig, initPolicy, trackBlocking, noRenaming)
       self.reorderBuffer = reorderBuffer
       self.scheduler = scheduler
       self.uArchConfig = uArchConfig
@@ -2381,7 +2410,7 @@ def getURL(instrStr):
 
 # Returns the throughput
 def runSimulation(disas, uArchConfig: MicroArchConfig, alignmentOffset, initPolicy, noMicroFusion, noMacroFusion, simpleFrontEnd, minIterations, minCycles,
-                  printDetails=False, traceFile=None, graphFile=None, depGraphFile=None, jsonFile=None, timelineFile=None, trackBlocking=False):
+                  printDetails=False, traceFile=None, graphFile=None, depGraphFile=None, jsonFile=None, timelineFile=None, trackBlocking=False, noRenaming=False):
    instructions = getInstructions(disas, uArchConfig, importlib.import_module('instrData.'+uArchConfig.name+'_data'),
                                   alignmentOffset, noMicroFusion, noMacroFusion)
    if not instructions:
@@ -2397,7 +2426,7 @@ def runSimulation(disas, uArchConfig: MicroArchConfig, alignmentOffset, initPoli
 
    perfEvents: Dict[int, Dict[str, int]] = {}
    unroll = (not instructions[-1].isBranchInstr)
-   frontEnd = FrontEnd(instructions, rb, scheduler, uArchConfig, unroll, alignmentOffset, initPolicy, perfEvents, simpleFrontEnd, trackBlocking)
+   frontEnd = FrontEnd(instructions, rb, scheduler, uArchConfig, unroll, alignmentOffset, initPolicy, perfEvents, simpleFrontEnd, trackBlocking, noRenaming)
 
    clock = 0
    rnd = 0
@@ -2506,6 +2535,7 @@ def main():
    parser.add_argument('-simpleFrontEnd', help='Simulate a simple front end that is only limited by the issue width', action='store_true')
    parser.add_argument('-noMicroFusion', help='Variant that does not support micro-fusion', action='store_true')
    parser.add_argument('-noMacroFusion', help='Variant that does not support macro-fusion', action='store_true')
+   parser.add_argument('-noRenaming', help='Disable register renaming to show WAR/WAW false dependencies', action='store_true')
    parser.add_argument('-alignmentOffset', help='Alignment offset (relative to a 64-Byte cache line), or "all"; default: 0', default='0')
    parser.add_argument('-minIterations', help='Simulate at least this many iterations; default: 10', type=int, default=10)
    parser.add_argument('-minCycles', help='Simulate at least this many cycles; default: 500', type=int, default=500)
@@ -2536,7 +2566,8 @@ def main():
       with futures.ProcessPoolExecutor() as executor:
          TPList = list(executor.map(runSimulation, disasList, uArchConfigsList, repeat(int(args.alignmentOffset)), repeat(args.initPolicy),
                                                    repeat(args.noMicroFusion), repeat(args.noMacroFusion), repeat(args.simpleFrontEnd),
-                                                   repeat(args.minIterations), repeat(args.minCycles)))
+                                                   repeat(args.minIterations), repeat(args.minCycles), repeat(False), repeat(None), repeat(None),
+                                                   repeat(None), repeat(None), repeat(None), repeat(False), repeat(args.noRenaming)))
       TPDict = {}
       for uArch, TP in zip(allMicroArchs, TPList):
          TPDict.setdefault(TP, []).append(str(uArch))
@@ -2557,7 +2588,9 @@ def main():
          exit(1)
       with futures.ProcessPoolExecutor() as executor:
          TPList = list(executor.map(runSimulation, repeat(disas), repeat(uArchConfig), range(0,64), repeat(args.initPolicy), repeat(args.noMicroFusion),
-                                                   repeat(args.noMacroFusion), repeat(args.simpleFrontEnd), repeat(args.minIterations), repeat(args.minCycles)))
+                                                   repeat(args.noMacroFusion), repeat(args.simpleFrontEnd), repeat(args.minIterations), repeat(args.minCycles),
+                                                   repeat(False), repeat(None), repeat(None), repeat(None), repeat(None), repeat(None), repeat(False),
+                                                   repeat(args.noRenaming)))
       TPDict = {}
       for al, TP in enumerate(TPList):
          TPDict.setdefault(TP, []).append(str(al))
@@ -2571,7 +2604,8 @@ def main():
          print('    - {:.2f} otherwise\n'.format(sortedTP[-1][0], sortedTP[-1][1]))
    else:
       TP = runSimulation(disas, uArchConfig, int(args.alignmentOffset), args.initPolicy, args.noMicroFusion, args.noMacroFusion, args.simpleFrontEnd,
-                         args.minIterations, args.minCycles, not args.TPonly, args.trace, args.graph, args.depGraph, args.json, args.timeline, args.trackBlocking)
+                         args.minIterations, args.minCycles, not args.TPonly, args.trace, args.graph, args.depGraph, args.json, args.timeline, args.trackBlocking,
+                         args.noRenaming)
       if args.TPonly:
          print('{:.2f}'.format(TP))
 
