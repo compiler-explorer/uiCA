@@ -44,8 +44,6 @@ def format_output(data, max_iterations=None):
         timeline = {}
         for cycle_str, event in uop['events'].items():
             cycle = int(cycle_str)
-            if cycle not in timeline:
-                timeline[cycle] = []
 
             # Extract event code (handle blocking objects)
             if isinstance(event, dict):
@@ -58,6 +56,8 @@ def format_output(data, max_iterations=None):
             if event_code == 'r':
                 continue
 
+            if cycle not in timeline:
+                timeline[cycle] = []
             if event_code not in timeline[cycle]:
                 timeline[cycle].append(event_code)
 
