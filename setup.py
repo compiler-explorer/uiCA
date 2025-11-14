@@ -66,23 +66,27 @@ class XEDBuildExt(build_ext):
         if not xed_module:
             raise RuntimeError("XED module build failed - no xed.so/pyd found")
 
-        # Copy to both package root AND site-packages for editable installs
+        # Copy XED module to multiple locations for different install scenarios
         import shutil
         import sysconfig
 
-        # Copy to project root
+        # 1. Copy to project root (for editable installs and source builds)
         dest_root = Path(".") / xed_module.name
         print(f"Copying {xed_module} -> {dest_root}")
         shutil.copy2(xed_module, dest_root)
 
-        # For editable installs, also copy to site-packages
+        # 2. Copy to build lib directory (for wheel builds)
+        if self.build_lib:
+            dest_build = Path(self.build_lib) / xed_module.name
+            print(f"Copying {xed_module} -> {dest_build}")
+            shutil.copy2(xed_module, dest_build)
+
+        # 3. For editable installs, also copy to site-packages
         site_packages = sysconfig.get_path("purelib")
         if site_packages:
             dest_site = Path(site_packages) / xed_module.name
             print(f"Copying {xed_module} -> {dest_site}")
             shutil.copy2(xed_module, dest_site)
-        else:
-            raise RuntimeError("Could not find site-packages directory")
 
 
 setup(

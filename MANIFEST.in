@@ -1,0 +1,3 @@
+include xed*.so
+include _xed_build_trigger*.so
+recursive-include instrData *.py
