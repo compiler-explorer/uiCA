@@ -12,44 +12,44 @@ def parse_timeline(json_file):
         return json.load(f)
 
 def format_output(data, max_iterations=None):
-    """Format as ASCII with instruction | event timeline."""
+    """Format as ASCII with one line per uop, showing instruction on first uop's line."""
     instructions = data['instructions']
     uops = data['uops']
 
     # Find max instruction length
     max_instr_len = max(len(instr['asm']) for instr in instructions)
 
-    # Find max cycle and iteration
-    max_cycle = 0
-    max_rnd = 0
+    # Filter uops by max_iterations
+    filtered_uops = []
     for uop in uops:
-        max_rnd = max(max_rnd, uop['rnd'])
-        # Only consider cycles from uops we'll actually show
         if max_iterations is None or uop['rnd'] < max_iterations:
-            if uop['events']:
-                max_cycle = max(max_cycle, max(int(c) for c in uop['events'].keys()))
+            filtered_uops.append(uop)
 
-    # Limit iterations if requested
-    if max_iterations is not None:
-        max_rnd = min(max_rnd, max_iterations - 1)
+    # Sort by (rnd, instrID, lamUopID) to get uops in order
+    sorted_uops = sorted(filtered_uops, key=lambda u: (u['rnd'], u['instrID'], u['lamUopID']))
 
-    # Group uops by (instrID, rnd) - we want one line per instruction instance
-    # Since instructions can have multiple uops, we need to merge their events
-    instr_timelines = defaultdict(lambda: {})  # (instrID, rnd) -> {cycle: [events]}
+    # Order preference for display when multiple events in same cycle
+    event_order = ['P', 'Q', 'I', 'D', 'E', 'R']
 
-    for uop in uops:
-        if max_iterations is not None and uop['rnd'] >= max_iterations:
-            continue
+    lines = []
+    prev_instr_id = None
+    prev_rnd = None
 
-        key = (uop['instrID'], uop['rnd'])
+    for uop in sorted_uops:
+        instr_id = uop['instrID']
+        rnd = uop['rnd']
+        lam_uop_id = uop['lamUopID']
+
+        # Build timeline for this uop
+        timeline = {}
         for cycle_str, event in uop['events'].items():
             cycle = int(cycle_str)
-            if cycle not in instr_timelines[key]:
-                instr_timelines[key][cycle] = []
+            if cycle not in timeline:
+                timeline[cycle] = []
 
             # Extract event code (handle blocking objects)
             if isinstance(event, dict):
-                # Blocked event - skip for now (could show 'b' or similar)
+                # Blocked event - skip for now
                 continue
             else:
                 event_code = event
@@ -58,25 +58,10 @@ def format_output(data, max_iterations=None):
             if event_code == 'r':
                 continue
 
-            # Avoid duplicates in the same cycle
-            if event_code not in instr_timelines[key][cycle]:
-                instr_timelines[key][cycle].append(event_code)
+            if event_code not in timeline[cycle]:
+                timeline[cycle].append(event_code)
 
-    # Sort by (rnd, instrID) for output
-    sorted_keys = sorted(instr_timelines.keys(), key=lambda x: (x[1], x[0]))
-
-    lines = []
-    for instr_id, rnd in sorted_keys:
-        timeline = instr_timelines[(instr_id, rnd)]
-
-        # Get instruction assembly
-        instr_asm = instructions[instr_id]['asm']
-
-        # Build timeline string with events in order Q I D E R etc.
-        # Order preference for display when multiple events in same cycle
-        event_order = ['P', 'Q', 'I', 'D', 'E', 'R']
-
-        # Find last cycle with an event for this instruction
+        # Find last cycle with an event for this uop
         last_cycle = max(timeline.keys()) if timeline else 0
 
         timeline_chars = []
@@ -89,10 +74,20 @@ def format_output(data, max_iterations=None):
             else:
                 timeline_chars.append(' ')
 
-        # Format line
-        padded_instr = instr_asm.ljust(max_instr_len + 1)
+        # Show instruction on first uop's line, blank on subsequent uops
+        if instr_id != prev_instr_id or rnd != prev_rnd:
+            # First uop of this instruction instance
+            instr_asm = instructions[instr_id]['asm']
+            padded_instr = instr_asm.ljust(max_instr_len + 1)
+        else:
+            # Subsequent uop - use blank spaces
+            padded_instr = ' ' * (max_instr_len + 1)
+
         line = f"{padded_instr}|{''.join(timeline_chars)}"
         lines.append(line)
+
+        prev_instr_id = instr_id
+        prev_rnd = rnd
 
     return '\n'.join(lines)
 

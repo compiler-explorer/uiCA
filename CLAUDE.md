@@ -97,11 +97,43 @@ Use `-arch all` to compare all supported microarchitectures.
 
 ## Output Options
 
-- `-trace <file.html>` - Cycle-by-cycle execution trace
+- `-trace <file.html>` - Cycle-by-cycle execution trace (interactive HTML)
+- `-timeline <file.json>` - Timeline JSON output (machine-readable format)
 - `-graph <file.html>` - Performance event timeline graph
 - `-depGraph <file.svg>` - Dependency graph visualization
 - `-alignmentOffset <n|all>` - Test alignment sensitivity
 - `-TPonly` - Throughput prediction only (no detailed analysis)
+
+### Creating Test Binaries
+
+uiCA requires ELF object files (not raw binaries). To create a test:
+
+```bash
+# 1. Write assembly (must specify BITS 64 for 64-bit code)
+cat > test.asm << 'EOF'
+BITS 64
+mov rax, 1
+add rax, rbx
+EOF
+
+# 2. Assemble to ELF64 object file
+nasm -f elf64 -o test.o test.asm
+
+# 3. Run uiCA
+uv run uica test.o -arch SKL
+```
+
+### ASCII Timeline Visualization
+
+```bash
+# Generate timeline JSON
+uv run uica test.o -arch SKL -timeline timeline.json
+
+# Convert to ASCII (optional: specify max iterations)
+uv run python uica_ascii.py timeline.json [max_iterations]
+```
+
+**Note**: Use `uv run python` (NOT `uv run --with setuptools python`) for running scripts. The `--with setuptools` flag is only needed for build.py.
 
 ## Testing
 
